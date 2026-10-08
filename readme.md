@@ -34,7 +34,8 @@ Raft deals with 2 kind of failures
 - Not byzantine
 
 Property:
-- Election Safety
+- Election Safety 
+    - At most 1 leader elected in a term
 - Leader Append-Only
 - Log Matching
     - If two entries in different logs have the same index and term, then they store the same command
@@ -74,7 +75,8 @@ Leader election:
     - Wins election --> leader: Receive majority of votes --> Server vote for at most 1 candidate, first come first serve --> send heartbeat to others
     - Another leader --> While candidte waiting for vote, receive AppendEntries RPC from another server claim to be leader, if leader's term is >= candidate current --> trust, become follower, else reject, continue candidate
     - No winner --> measure split vote --> candidate timeout, start new election
-- Vote restriction (5.4.1): prevent a candidate from winning an election unless its log contains all committed entries
+- Vote restriction (5.4.1): prevent a candidate from winning an election unless its log contains all committed entries --> ensure leader for any given term con-
+tains all of the entries committed in previous terms (contains all commited entries)
     - Candidate must contact a majority of the cluster in order to be elected --> candidate can only become leader if its log contain all commmited entries
     - Voter reject RequestVote RPC if its log is more up to date
     - Up to date: compare index + term of last entry in log, if different term, larger term wins, if same term, longer logs wins
@@ -95,3 +97,22 @@ Log replication:
     - First come power, init next index = last index entry + 1
     - Append RPCs fail, retry with next index decrease
 - If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) --> why???
+
+Safty (commit)
+- lastApplied: actual index of highest log entry applied to state machine (initialized to 0, increases monotonically)
+- lastCommited: index of highest log entry known to be committed (initialized to 0, increases monotonically) --> safe to apply to state machine <--> has been replicated on logs of majority of server --> never lost or overwritten in the feature --> uarantees that committed entries are durable and will eventually be executed by all of the available state machines --> this is safty rule
+- Leader knows that an entry from its *current term* is committed once that entry is stored on a majority of the servers
+- Leader cannot immediately conclude that an entry from a *previous term* is committed once it is stored on a majority of servers?
+- Only log entries from the leader’s current term are committed by counting replicas
+- Once an entry from the current term has been committed in this way, then all prior entries are committed indirectly 
+- Not understand proof yet but understand intention: in order to save entries from previous term, leader force to commit entry from its current term, therefore all preceding entries is known to be commited (log matching property)
+
+Follower/Candidate crash
+- Follower/Candidate crash before --> future RequestVote and AppendEntries RPCs sent to it will fail --> retry indefinitely
+- Follower/Candidate crash after complete RPC before response: receive the same RPC when restart
+- Raft RPCs are idempotent
+
+Timing
+- Safety must not depend on timing
+- Availabity (the ability of the system to respond to clients in a timely manner) inevitably depend on timing
+- Without steady leader, cannot progresss --> maintain steady leader as long as broadcastTime << electionTimeout << MTBF
