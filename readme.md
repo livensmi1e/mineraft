@@ -37,6 +37,8 @@ Property:
 - Election Safety
 - Leader Append-Only
 - Log Matching
+    - If two entries in different logs have the same index and term, then they store the same command
+    - If two entries in different logs have the same index and term, then the logs are identical in all preceding entries
 - Leader Completeness
 - State Machine Safety
 
@@ -81,4 +83,15 @@ Leader election:
 - Start election, restart election timer
 
 Log replication:
-- 
+- Leader serves client request: new command, when to response to client?
+- Leader append new entry to logs, issue AppendEntries RPCs parallel
+- Log entry: command + term when leader receive that command
+- Leader decides when it is safe to commit to state machine: once leader have replicated on a majority of servers --> means all preceding logs are also commited (even created by previous leaders)
+- Leader keep track highest index known to be committed, include that index in feature Append RPCs --> other server eventually find out
+- Consistency check: when send AppendEntries RPC, include index and term of the entry in its log that immediately precedes the new entry --> follower not find entry in its logs with same index + term, reject
+- Conflicting entries in follower logs will be overwritten with entries from the leader’s logs
+    - Leader find latest logs entry where 2 logs agree, delete entries after that point, send all leader's entries after that point to follower
+    - Leader maintains next index for each follower - index of next log entry going to send to follower
+    - First come power, init next index = last index entry + 1
+    - Append RPCs fail, retry with next index decrease
+- If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) --> why???
