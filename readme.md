@@ -134,3 +134,28 @@ Timing
 
 ## Implementation
 
+What
+- Not a library, this is a lab simulating Raft cluster
+
+How:
+- Use sqlite3 as persistent storage
+
+Steps:
+    - Define server state
+    - Define cluster
+    - Manage persistent state & inject to server when reboot
+    - Define RPC as channel
+
+## Test
+
+Questions
+- How to test?
+- Level? Unit? System? Write unit test for a behavior / invariant in Raft rather than every function
+- How to simulate?
+    - Each server is a process --> hard to test, hard to manage --> each server is a Go object that runs in each Go routine
+    - RPC is Go channel
+
+
+## Read
+- https://thesquareplanet.com/blog/students-guide-to-raft/
+- https://pdos.csail.mit.edu/6.5840/index.html
