@@ -27,6 +27,18 @@ Questions:
     - For logs, no, this can be in memory because after joining cluster, it will eventually have the same logs as leader?
     - For state machine, no --> it can be lost on node failures, because after node recovers and join the cluster again, its log will reach the common state, then we can apply the logs to the state machine
 - What is definition of majority?
+    - Greater or equal N / 2 + 1
+- What happens when leader receive request from client, crash before completing?
+    - When leader receive request from client, it has to do 3 things: append logs, replicate and commit log and apply logs
+    - Before append logs --> lost
+    - After append, but before replicate --> lost
+    - After replicate, but before commit --> lost
+    - After commit, but before apply --> safety
+    - After apply, but before response --> safety
+- How client know it is safe to retry request?
+    - System neees to implement idempotency, for example requestID?
+- When server reject AppendLogs RPC, leader decrease nextIndex, but when it success, what does server do with that nextIndex?
+    - 
 
 Raft deals with 2 kind of failures
 - Network
@@ -41,7 +53,9 @@ Property:
     - If two entries in different logs have the same index and term, then they store the same command
     - If two entries in different logs have the same index and term, then the logs are identical in all preceding entries
 - Leader Completeness
+    - If a log entry is committed in a given term, then that entry will be present in the logs of the leaders for all higher-numbered terms
 - State Machine Safety
+    - If a server has applied a log entry at a given index to its state machine, no other server will ever apply a different log entry for the same index
 
 Server state
 - Three states: leader, follower, or candidate
@@ -85,7 +99,7 @@ tains all of the entries committed in previous terms (contains all commited entr
 - Start election, restart election timer
 
 Log replication:
-- Leader serves client request: new command, when to response to client?
+- Leader serves client request: new command, when to response to client? --> after apply entry to sate machine
 - Leader append new entry to logs, issue AppendEntries RPCs parallel
 - Log entry: command + term when leader receive that command
 - Leader decides when it is safe to commit to state machine: once leader have replicated on a majority of servers --> means all preceding logs are also commited (even created by previous leaders)
@@ -116,3 +130,7 @@ Timing
 - Safety must not depend on timing
 - Availabity (the ability of the system to respond to clients in a timely manner) inevitably depend on timing
 - Without steady leader, cannot progresss --> maintain steady leader as long as broadcastTime << electionTimeout << MTBF
+
+
+## Implementation
+
