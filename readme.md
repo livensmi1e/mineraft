@@ -137,14 +137,14 @@ Timing
 What
 - Not a library, this is a lab simulating Raft cluster
 
-How:
-- Use sqlite3 as persistent storage
-
-Steps:
-    - Define server state
-    - Define cluster
-    - Manage persistent state & inject to server when reboot
-    - Define RPC as channel
+Steps (focus on Raft logic first, then cluster and simulation logic later)
+- Define server state
+- Implement election timer
+- Implement RequestVote RPC request & response
+- Implement AppendEntries RPC request & response
+- Manage persistent state & inject to server when reboot
+- Define cluster
+- Define RPC as channel
 
 ## Test
 
@@ -154,6 +154,7 @@ Questions
 - How to simulate?
     - Each server is a process --> hard to test, hard to manage --> each server is a Go object that runs in each Go routine
     - RPC is Go channel
+- How to make a server fail and restart?
 
 
 ## Read
