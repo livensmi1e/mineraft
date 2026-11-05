@@ -8,7 +8,17 @@
 
 3. Implement
 
+4. Forgot core ideas so read again to find wow moment
+
 ## Notes
+
+Intuiative things must understand
+- Why need majority vote to be leader? --> in order to be voted, logs need to be update to date --> to avoid override log index known to be commited
+    - Majority intersection
+- Why leader can only directly commit an log entry on its current term from knowing successfully replicate on majority servers? But cannot apply this rule for previous log entries? 
+    - An entry from a previous term being replicated on a majority does not necessarily mean it is committed, why?
+- Why commiting a log entry means all preceding log entries is guaranteed to be commited?
+
 
 Includes:
 - Leader election
@@ -38,7 +48,6 @@ Questions:
 - How client know it is safe to retry request?
     - System neees to implement idempotency, for example requestID?
 - When server reject AppendLogs RPC, leader decrease nextIndex, but when it success, what does server do with that nextIndex?
-    - 
 
 Raft deals with 2 kind of failures
 - Network
