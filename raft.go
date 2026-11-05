@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"math/rand"
+	"sync"
 	"time"
 )
 
-type state int
+type state string
 
 const (
-	follower state = iota
-	candidate
-	leader
+	follower  state = "follower"
+	candidate state = "candidate"
+	leader    state = "leader"
 )
 
 const (
@@ -18,67 +21,151 @@ const (
 	maxElectionTimeout = 300 * time.Millisecond
 )
 
+var errRaftNotImplemented = errors.New("raft handler not implemented")
+
 type id string
 
 type logEntry struct {
-	cmd  string // represent as "x = 3"
-	term int
+	Command string `json:"command"`
+	Term    int    `json:"term"`
 }
 
-type request struct {
+// These RPC values mirror Figure 2 of the Raft paper. The transport only moves
+// them; deciding how to answer them is deliberately left to the Raft core.
+type requestVoteArgs struct {
+	Term         int `json:"term"`
+	CandidateID  id  `json:"candidateId"`
+	LastLogIndex int `json:"lastLogIndex"`
+	LastLogTerm  int `json:"lastLogTerm"`
+}
+
+type requestVoteReply struct {
+	Term        int  `json:"term"`
+	VoteGranted bool `json:"voteGranted"`
+}
+
+type appendEntriesArgs struct {
+	Term         int        `json:"term"`
+	LeaderID     id         `json:"leaderId"`
+	PrevLogIndex int        `json:"prevLogIndex"`
+	PrevLogTerm  int        `json:"prevLogTerm"`
+	Entries      []logEntry `json:"entries"`
+	LeaderCommit int        `json:"leaderCommit"`
+}
+
+type appendEntriesReply struct {
+	Term    int  `json:"term"`
+	Success bool `json:"success"`
 }
 
 type server struct {
-	me    id
-	state state
+	mu sync.RWMutex
 
-	// volatile
-	commitIndex int // index of highest log entry known to be committed, increase monotonically
-	lastApplied int // index of highest log entry applied to state machine, increase monotonically
+	me        id
+	peers     []id
+	state     state
+	transport *network
 
-	nextIndex  map[id]int // index of the next log entry to send to each server
-	matchIndex map[id]int // index of highest log entry known to be replicated on each servers
+	// Volatile state on all servers.
+	commitIndex int
+	lastApplied int
 
-	// persistent
-	currentTerm int // latest term server has seen, increases monotonically
+	// Volatile state on leaders.
+	nextIndex  map[id]int
+	matchIndex map[id]int
+
+	// Persistent state on all servers.
+	currentTerm int
 	votedFor    id
 	log         []logEntry
 
-	requestCh chan request
-	timer     *time.Timer
-	done      chan struct{}
+	timer  *time.Timer
+	stopCh chan struct{}
+	done   chan struct{}
 }
 
-func newServer(me id, peers []id, currentTerm int, votedFor id, log []logEntry) *server {
-	server := &server{
-		me:    me,
-		state: follower,
-
-		nextIndex:  make(map[id]int),
-		matchIndex: make(map[id]int),
-
+func newServer(me id, peers []id, transport *network, currentTerm int, votedFor id, log []logEntry) *server {
+	s := &server{
+		me:          me,
+		peers:       append([]id(nil), peers...),
+		state:       follower,
+		transport:   transport,
+		nextIndex:   make(map[id]int),
+		matchIndex:  make(map[id]int),
 		currentTerm: currentTerm,
 		votedFor:    votedFor,
-		log:         log,
+		log:         append([]logEntry(nil), log...),
+		timer:       time.NewTimer(randomElectionTimeout()),
+		stopCh:      make(chan struct{}),
+		done:        make(chan struct{}),
+	}
 
-		timer: time.NewTimer(randomElectionTimeout()),
-		done:  make(chan struct{}),
-	}
-	for _, peer := range peers {
-		if peer != me {
-			server.nextIndex[peer] = server.lastLogIndex()
-		}
-	}
-	go server.run()
-	return server
+	go s.run()
+	return s
 }
 
-func (s server) lastLogIndex() int {
+func (s *server) lastLogIndex() int {
 	return len(s.log)
 }
 
-func (s server) run() {
+// run is the starting point for election timers, heartbeats, and applying
+// committed entries. Infrastructure shutdown already works; Raft behavior is
+// intentionally yours to implement here.
+func (s *server) run() {
 	defer close(s.done)
+	<-s.stopCh
+}
+
+func (s *server) stop() {
+	select {
+	case <-s.stopCh:
+		return
+	default:
+		close(s.stopCh)
+	}
+	<-s.done
+	if !s.timer.Stop() {
+		select {
+		case <-s.timer.C:
+		default:
+		}
+	}
+}
+
+// RequestVote is called concurrently by the simulated network. Protect Raft
+// state with s.mu while implementing the rules from Figure 2.
+func (s *server) RequestVote(_ context.Context, _ requestVoteArgs) (requestVoteReply, error) {
+	return requestVoteReply{}, errRaftNotImplemented
+}
+
+// AppendEntries handles both heartbeats and log replication.
+func (s *server) AppendEntries(_ context.Context, _ appendEntriesArgs) (appendEntriesReply, error) {
+	return appendEntriesReply{}, errRaftNotImplemented
+}
+
+// requestVote and appendEntries are the only outbound RPC calls the Raft core
+// needs. Context cancellation is how callers stop waiting for failed peers.
+func (s *server) requestVote(ctx context.Context, peer id, args requestVoteArgs) (requestVoteReply, error) {
+	return s.transport.requestVote(ctx, s.me, peer, args)
+}
+
+func (s *server) appendEntries(ctx context.Context, peer id, args appendEntriesArgs) (appendEntriesReply, error) {
+	return s.transport.appendEntries(ctx, s.me, peer, args)
+}
+
+func (s *server) snapshot() nodeSnapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return nodeSnapshot{
+		ID:           s.me,
+		State:        s.state,
+		CurrentTerm:  s.currentTerm,
+		VotedFor:     s.votedFor,
+		CommitIndex:  s.commitIndex,
+		LastApplied:  s.lastApplied,
+		Log:          append([]logEntry{}, s.log...),
+	}
 }
 
 func randomElectionTimeout() time.Duration {

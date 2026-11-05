@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Raft Lab</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <h1>Raft Lab</h1>
+    <div class="connection" aria-live="polite">
+      <span class="status-dot" id="connection-dot"></span>
+      <span id="connection-status">Connecting…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="controls" aria-label="Network controls">
+      <p>Click a node to isolate or reconnect it.</p>
+      <label>
+        Network
+        <select id="network-mode">
+          <option value="reliable">Reliable · 35 ms</option>
+          <option value="unreliable">Unreliable · delay + 15% drop</option>
+        </select>
+      </label>
+    </section>
+
+    <div class="workspace">
+      <section class="simulation" aria-labelledby="cluster-heading">
+        <div class="section-heading">
+          <h2 id="cluster-heading">Cluster</h2>
+          <div class="legend" aria-label="RPC legend">
+            <span><i class="vote-key"></i> RequestVote</span>
+            <span><i class="append-key"></i> AppendEntries</span>
+          </div>
+        </div>
+
+        <div class="cluster-stage" id="cluster-stage" aria-label="Raft cluster diagram">
+          <svg id="link-layer" aria-hidden="true"></svg>
+          <div id="message-layer" aria-hidden="true"></div>
+          <div id="node-layer"></div>
+          <p class="stage-note">Waiting for Raft RPCs</p>
+        </div>
+
+        <div class="logs" aria-labelledby="logs-heading">
+          <div class="section-heading compact">
+            <h3 id="logs-heading">Replicated logs</h3>
+            <span>Solid border: committed</span>
+          </div>
+          <div class="log-table" id="log-table"></div>
+        </div>
+      </section>
+
+      <aside class="details" aria-labelledby="details-heading">
+        <div class="section-heading compact">
+          <h2 id="details-heading">Select a node</h2>
+        </div>
+        <dl id="node-details" class="node-details">
+          <div><dt>Role</dt><dd>—</dd></div>
+          <div><dt>Term</dt><dd>—</dd></div>
+          <div><dt>Voted for</dt><dd>—</dd></div>
+          <div><dt>Commit index</dt><dd>—</dd></div>
+          <div><dt>Last applied</dt><dd>—</dd></div>
+        </dl>
+
+        <h3 class="event-heading">RPC events</h3>
+        <ol id="event-list" class="event-list" aria-live="polite" aria-label="RPC events">
+          <li class="empty-event">No RPC events yet.</li>
+        </ol>
+      </aside>
+    </div>
+  </main>
+</body>
+</html>
