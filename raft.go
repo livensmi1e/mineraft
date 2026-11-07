@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"math/rand"
 	"sync"
 	"time"
@@ -20,8 +19,6 @@ const (
 	minElectionTimeout = 150 * time.Millisecond
 	maxElectionTimeout = 300 * time.Millisecond
 )
-
-var errRaftNotImplemented = errors.New("raft handler not implemented")
 
 type id string
 
@@ -104,13 +101,16 @@ func newServer(me id, peers []id, transport *network, currentTerm int, votedFor 
 	return s
 }
 
-func (s *server) lastLogIndex() int {
-	return len(s.log)
+func (s *server) lastLog() (index, term int) {
+	index = len(s.log)
+	if index == 0 {
+		return index, -1
+	}
+	return index, s.log[index-1].Term
 }
 
 // run is the starting point for election timers, heartbeats, and applying
-// committed entries. Infrastructure shutdown already works; Raft behavior is
-// intentionally yours to implement here.
+// committed entries.
 func (s *server) run() {
 	defer close(s.done)
 	<-s.stopCh
@@ -132,15 +132,66 @@ func (s *server) stop() {
 	}
 }
 
-// RequestVote is called concurrently by the simulated network. Protect Raft
-// state with s.mu while implementing the rules from Figure 2.
-func (s *server) RequestVote(_ context.Context, _ requestVoteArgs) (requestVoteReply, error) {
-	return requestVoteReply{}, errRaftNotImplemented
+// RequestVote is called concurrently by the simulated network.
+func (s *server) RequestVote(ctx context.Context, args requestVoteArgs) (requestVoteReply, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if args.Term < s.currentTerm {
+		return requestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
+	}
+
+	votedFor := s.votedFor
+	lastLogIndex, lastLogTerm := s.lastLog()
+	canVote := votedFor == "" || votedFor == args.CandidateID
+	logIsUpToDate := (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+
+	if canVote && logIsUpToDate {
+		return requestVoteReply{Term: s.currentTerm, VoteGranted: true}, nil
+	}
+
+	return requestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
 }
 
 // AppendEntries handles both heartbeats and log replication.
-func (s *server) AppendEntries(_ context.Context, _ appendEntriesArgs) (appendEntriesReply, error) {
-	return appendEntriesReply{}, errRaftNotImplemented
+func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (appendEntriesReply, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if args.Term < s.currentTerm {
+		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+	}
+
+	if args.PrevLogIndex > len(s.log) {
+		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+	}
+	entry := s.log[args.PrevLogIndex]
+	if entry.Term != args.PrevLogTerm {
+		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+	}
+
+	conflictIndex := -1
+	for i, entry := range args.Entries {
+		index := args.PrevLogIndex + i + 1
+		if entry.Term != s.log[index-1].Term {
+			conflictIndex = index
+			break
+		}
+	}
+	s.mu.Lock()
+	if conflictIndex != -1 {
+		s.log = s.log[0:conflictIndex]
+		for _, entry := range args.Entries {
+			s.log = append(s.log, entry)
+		}
+	}
+	if args.LeaderCommit > s.commitIndex {
+		lastNewEntryIndex := len(args.Entries) + args.PrevLogIndex
+		s.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
+	}
+	s.mu.Unlock()
+
+	return appendEntriesReply{Term: s.currentTerm, Success: true}, nil
 }
 
 // requestVote and appendEntries are the only outbound RPC calls the Raft core
@@ -158,13 +209,13 @@ func (s *server) snapshot() nodeSnapshot {
 	defer s.mu.RUnlock()
 
 	return nodeSnapshot{
-		ID:           s.me,
-		State:        s.state,
-		CurrentTerm:  s.currentTerm,
-		VotedFor:     s.votedFor,
-		CommitIndex:  s.commitIndex,
-		LastApplied:  s.lastApplied,
-		Log:          append([]logEntry{}, s.log...),
+		ID:          s.me,
+		State:       s.state,
+		CurrentTerm: s.currentTerm,
+		VotedFor:    s.votedFor,
+		CommitIndex: s.commitIndex,
+		LastApplied: s.lastApplied,
+		Log:         append([]logEntry{}, s.log...),
 	}
 }
 
