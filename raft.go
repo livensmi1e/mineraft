@@ -140,7 +140,6 @@ func (s *server) RequestVote(ctx context.Context, args requestVoteArgs) (request
 	if args.Term < s.currentTerm {
 		return requestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
 	}
-
 	if args.Term > s.currentTerm {
 		s.currentTerm = args.Term
 		s.votedFor = ""
@@ -161,17 +160,22 @@ func (s *server) RequestVote(ctx context.Context, args requestVoteArgs) (request
 
 // AppendEntries handles both heartbeats and log replication.
 func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (appendEntriesReply, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if args.Term < s.currentTerm {
 		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+	}
+	if args.Term > s.currentTerm {
+		s.currentTerm = args.Term
+		s.votedFor = ""
+		s.state = follower
 	}
 
 	if args.PrevLogIndex > len(s.log) {
 		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
 	}
-	entry := s.log[args.PrevLogIndex]
+	entry := s.log[args.PrevLogIndex-1]
 	if entry.Term != args.PrevLogTerm {
 		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
 	}
@@ -179,14 +183,17 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 	conflictIndex := -1
 	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + i + 1
+		if index > len(s.log) {
+			conflictIndex = len(s.log) + 1
+			break
+		}
 		if entry.Term != s.log[index-1].Term {
 			conflictIndex = index
 			break
 		}
 	}
-	s.mu.Lock()
 	if conflictIndex != -1 {
-		s.log = s.log[0:conflictIndex]
+		s.log = s.log[0 : conflictIndex-1]
 		for _, entry := range args.Entries {
 			s.log = append(s.log, entry)
 		}
@@ -195,7 +202,6 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 		lastNewEntryIndex := len(args.Entries) + args.PrevLogIndex
 		s.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
 	}
-	s.mu.Unlock()
 
 	return appendEntriesReply{Term: s.currentTerm, Success: true}, nil
 }
