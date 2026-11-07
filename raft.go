@@ -166,18 +166,29 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 	if args.Term < s.currentTerm {
 		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
 	}
+
+	// valid leader request, reset timer
+	s.resetElectionTimer()
+
+	if s.state == candidate {
+		s.state = follower
+	}
 	if args.Term > s.currentTerm {
 		s.currentTerm = args.Term
 		s.votedFor = ""
-		s.state = follower
 	}
 
 	if args.PrevLogIndex > len(s.log) {
 		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
 	}
-	entry := s.log[args.PrevLogIndex-1]
-	if entry.Term != args.PrevLogTerm {
-		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+	// if prevLogIndex <= 0 {
+	// 	leader append all new entries to server's log, so not need to find matching entry
+	// }
+	if args.PrevLogIndex >= 1 {
+		entry := s.log[args.PrevLogIndex-1]
+		if entry.Term != args.PrevLogTerm {
+			return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+		}
 	}
 
 	conflictIndex := -1
@@ -194,7 +205,7 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 	}
 	if conflictIndex != -1 {
 		s.log = s.log[0 : conflictIndex-1]
-		for _, entry := range args.Entries {
+		for _, entry := range args.Entries[conflictIndex-args.PrevLogIndex-1 : len(args.Entries)] {
 			s.log = append(s.log, entry)
 		}
 	}
@@ -229,6 +240,16 @@ func (s *server) snapshot() nodeSnapshot {
 		LastApplied: s.lastApplied,
 		Log:         append([]logEntry{}, s.log...),
 	}
+}
+
+func (s *server) resetElectionTimer() {
+	if !s.timer.Stop() {
+		select {
+		case <-s.timer.C:
+		default:
+		}
+	}
+	s.timer.Reset(randomElectionTimeout())
 }
 
 func randomElectionTimeout() time.Duration {

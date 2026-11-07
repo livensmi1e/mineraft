@@ -331,7 +331,7 @@ func TestAppendEntries(t *testing.T) {
 			wantCommit: 1,
 		},
 		{
-			name: "step down for leader in same term",
+			name: "step down to follower for leader in same term",
 			role: candidate,
 			term: 3,
 			log:  []logEntry{{Command: "x=1", Term: 1}},
