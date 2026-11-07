@@ -98,6 +98,82 @@ func TestRequestVote(t *testing.T) {
 			wantRole:  follower,
 			wantTerm:  3,
 		},
+		{
+			name: "reject shorter log with same last term",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 3},
+			},
+			args: requestVoteArgs{
+				Term:         3,
+				CandidateID:  "S2",
+				LastLogIndex: 1,
+				LastLogTerm:  3,
+			},
+			wantReply: requestVoteReply{Term: 3, VoteGranted: false},
+			wantRole:  follower,
+			wantTerm:  3,
+		},
+		{
+			name: "grant vote for equally up-to-date log",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 3},
+			},
+			args: requestVoteArgs{
+				Term:         3,
+				CandidateID:  "S2",
+				LastLogIndex: 2,
+				LastLogTerm:  3,
+			},
+			wantReply:    requestVoteReply{Term: 3, VoteGranted: true},
+			wantRole:     follower,
+			wantTerm:     3,
+			wantVotedFor: "S2",
+		},
+		{
+			name: "grant vote for higher last log term despite shorter log",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 2},
+				{Command: "z=3", Term: 2},
+			},
+			args: requestVoteArgs{
+				Term:         3,
+				CandidateID:  "S2",
+				LastLogIndex: 1,
+				LastLogTerm:  3,
+			},
+			wantReply:    requestVoteReply{Term: 3, VoteGranted: true},
+			wantRole:     follower,
+			wantTerm:     3,
+			wantVotedFor: "S2",
+		},
+		{
+			name:     "adopt newer term before rejecting stale log",
+			role:     candidate,
+			term:     3,
+			votedFor: "S3",
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 3},
+			},
+			args: requestVoteArgs{
+				Term:         4,
+				CandidateID:  "S2",
+				LastLogIndex: 10,
+				LastLogTerm:  2,
+			},
+			wantReply: requestVoteReply{Term: 4, VoteGranted: false},
+			wantRole:  follower,
+			wantTerm:  4,
+		},
 	}
 
 	for _, test := range tests {
@@ -128,17 +204,19 @@ func TestRequestVote(t *testing.T) {
 
 func TestAppendEntries(t *testing.T) {
 	tests := []struct {
-		name        string
-		role        state
-		term        int
-		log         []logEntry
-		commitIndex int
-		args        appendEntriesArgs
-		wantReply   appendEntriesReply
-		wantRole    state
-		wantTerm    int
-		wantLog     []logEntry
-		wantCommit  int
+		name         string
+		role         state
+		term         int
+		votedFor     id
+		log          []logEntry
+		commitIndex  int
+		args         appendEntriesArgs
+		wantReply    appendEntriesReply
+		wantRole     state
+		wantTerm     int
+		wantVotedFor id
+		wantLog      []logEntry
+		wantCommit   int
 	}{
 		{
 			name:      "reject stale term",
@@ -221,11 +299,150 @@ func TestAppendEntries(t *testing.T) {
 			wantTerm:  3,
 			wantLog:   []logEntry{{Command: "x=1", Term: 1}},
 		},
+		{
+			name:      "accept heartbeat for empty log",
+			role:      follower,
+			term:      1,
+			args:      appendEntriesArgs{Term: 1, LeaderID: "S2", PrevLogIndex: 0, PrevLogTerm: -1},
+			wantReply: appendEntriesReply{Term: 1, Success: true},
+			wantRole:  follower,
+			wantTerm:  1,
+			wantLog:   nil,
+		},
+		{
+			name: "reject previous term mismatch",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 2},
+			},
+			commitIndex: 1,
+			args: appendEntriesArgs{
+				Term:         3,
+				LeaderID:     "S2",
+				PrevLogIndex: 2,
+				PrevLogTerm:  3,
+			},
+			wantReply:  appendEntriesReply{Term: 3, Success: false},
+			wantRole:   follower,
+			wantTerm:   3,
+			wantLog:    []logEntry{{Command: "x=1", Term: 1}, {Command: "y=2", Term: 2}},
+			wantCommit: 1,
+		},
+		{
+			name: "step down for leader in same term",
+			role: candidate,
+			term: 3,
+			log:  []logEntry{{Command: "x=1", Term: 1}},
+			args: appendEntriesArgs{
+				Term:         3,
+				LeaderID:     "S2",
+				PrevLogIndex: 1,
+				PrevLogTerm:  1,
+			},
+			wantReply: appendEntriesReply{Term: 3, Success: true},
+			wantRole:  follower,
+			wantTerm:  3,
+			wantLog:   []logEntry{{Command: "x=1", Term: 1}},
+		},
+		{
+			name:     "adopt newer term before rejecting missing previous entry",
+			role:     candidate,
+			term:     2,
+			votedFor: "S3",
+			log:      []logEntry{{Command: "x=1", Term: 1}},
+			args: appendEntriesArgs{
+				Term:         3,
+				LeaderID:     "S2",
+				PrevLogIndex: 2,
+				PrevLogTerm:  1,
+			},
+			wantReply: appendEntriesReply{Term: 3, Success: false},
+			wantRole:  follower,
+			wantTerm:  3,
+			wantLog:   []logEntry{{Command: "x=1", Term: 1}},
+		},
+		{
+			name: "append only entries after matching overlap",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 2},
+				{Command: "old=3", Term: 2},
+			},
+			args: appendEntriesArgs{
+				Term:         3,
+				LeaderID:     "S2",
+				PrevLogIndex: 1,
+				PrevLogTerm:  1,
+				Entries: []logEntry{
+					{Command: "y=2", Term: 2},
+					{Command: "new=3", Term: 3},
+					{Command: "new=4", Term: 3},
+				},
+			},
+			wantReply: appendEntriesReply{Term: 3, Success: true},
+			wantRole:  follower,
+			wantTerm:  3,
+			wantLog: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 2},
+				{Command: "new=3", Term: 3},
+				{Command: "new=4", Term: 3},
+			},
+		},
+		{
+			name: "clamp leader commit to last matching entry",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 2},
+				{Command: "z=3", Term: 3},
+			},
+			commitIndex: 1,
+			args: appendEntriesArgs{
+				Term:         3,
+				LeaderID:     "S2",
+				PrevLogIndex: 3,
+				PrevLogTerm:  3,
+				LeaderCommit: 10,
+			},
+			wantReply:  appendEntriesReply{Term: 3, Success: true},
+			wantRole:   follower,
+			wantTerm:   3,
+			wantLog:    []logEntry{{Command: "x=1", Term: 1}, {Command: "y=2", Term: 2}, {Command: "z=3", Term: 3}},
+			wantCommit: 3,
+		},
+		{
+			name: "do not decrease commit index",
+			role: follower,
+			term: 3,
+			log: []logEntry{
+				{Command: "x=1", Term: 1},
+				{Command: "y=2", Term: 2},
+			},
+			commitIndex: 2,
+			args: appendEntriesArgs{
+				Term:         3,
+				LeaderID:     "S2",
+				PrevLogIndex: 2,
+				PrevLogTerm:  2,
+				LeaderCommit: 1,
+			},
+			wantReply:  appendEntriesReply{Term: 3, Success: true},
+			wantRole:   follower,
+			wantTerm:   3,
+			wantLog:    []logEntry{{Command: "x=1", Term: 1}, {Command: "y=2", Term: 2}},
+			wantCommit: 2,
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			s := newUnitServer(t, test.role, test.term, "", test.log)
+			s := newUnitServer(t, test.role, test.term, test.votedFor, test.log)
 			s.commitIndex = test.commitIndex
 
 			reply, err := callAppendEntries(t, s, test.args)
@@ -240,6 +457,9 @@ func TestAppendEntries(t *testing.T) {
 			}
 			if s.currentTerm != test.wantTerm {
 				t.Errorf("currentTerm = %d, want %d", s.currentTerm, test.wantTerm)
+			}
+			if s.votedFor != test.wantVotedFor {
+				t.Errorf("votedFor = %q, want %q", s.votedFor, test.wantVotedFor)
 			}
 			if !reflect.DeepEqual(s.log, test.wantLog) {
 				t.Errorf("log = %+v, want %+v", s.log, test.wantLog)
