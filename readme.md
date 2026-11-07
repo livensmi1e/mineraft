@@ -139,6 +139,10 @@ Timing
 - Safety must not depend on timing
 - Availabity (the ability of the system to respond to clients in a timely manner) inevitably depend on timing
 - Without steady leader, cannot progresss --> maintain steady leader as long as broadcastTime << electionTimeout << MTBF
+- When to reset election timer?
+    - Receive valid append entries
+    - Transition to candidate state to start election
+    - Vote for a candidate
 
 Heartbeat
 - What to do when receive heartbeats? Do need to care about prevLogIndex and prevLogTerm?

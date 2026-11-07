@@ -152,6 +152,7 @@ func (s *server) RequestVote(ctx context.Context, args requestVoteArgs) (request
 
 	if canVote && logIsUpToDate {
 		s.votedFor = args.CandidateID
+		s.resetElectionTimer()
 		return requestVoteReply{Term: s.currentTerm, VoteGranted: true}, nil
 	}
 
