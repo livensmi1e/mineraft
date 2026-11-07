@@ -134,19 +134,25 @@ func (s *server) stop() {
 
 // RequestVote is called concurrently by the simulated network.
 func (s *server) RequestVote(ctx context.Context, args requestVoteArgs) (requestVoteReply, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if args.Term < s.currentTerm {
 		return requestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
 	}
 
-	votedFor := s.votedFor
+	if args.Term > s.currentTerm {
+		s.currentTerm = args.Term
+		s.votedFor = ""
+		s.state = follower
+	}
+
 	lastLogIndex, lastLogTerm := s.lastLog()
-	canVote := votedFor == "" || votedFor == args.CandidateID
+	canVote := s.votedFor == "" || s.votedFor == args.CandidateID
 	logIsUpToDate := (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
 	if canVote && logIsUpToDate {
+		s.votedFor = args.CandidateID
 		return requestVoteReply{Term: s.currentTerm, VoteGranted: true}, nil
 	}
 
