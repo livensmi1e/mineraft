@@ -109,11 +109,106 @@ func (s *server) lastLog() (index, term int) {
 	return index, s.log[index-1].Term
 }
 
+func (s *server) becomeLeader() {
+	s.state = leader
+
+	lastLogIndex, _ := s.lastLog()
+	for _, p := range s.peers {
+		if p == s.me {
+			continue
+		}
+		s.nextIndex[p] = lastLogIndex + 1
+		s.matchIndex[p] = 0
+	}
+
+	replies := make(map[id]appendEntriesReply)
+	var wg sync.WaitGroup
+	for _, p := range s.peers {
+		if p == s.me {
+			continue
+		}
+		wg.Go(func() {
+			lastLogIndex, lastLogTerm := s.lastLog()
+			reply, _ := s.appendEntries(context.Background(), p, appendEntriesArgs{
+				Term:         s.currentTerm,
+				LeaderID:     s.me,
+				PrevLogIndex: lastLogIndex,
+				PrevLogTerm:  lastLogTerm,
+				LeaderCommit: s.commitIndex,
+			})
+			replies[p] = reply
+		})
+	}
+	wg.Wait()
+}
+
+func (s *server) startElection() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// start election
+	s.currentTerm++
+	s.state = candidate
+	s.votedFor = s.me
+	s.resetElectionTimer()
+	replies := make(map[id]requestVoteReply)
+	var wg sync.WaitGroup
+	for _, p := range s.peers {
+		if p == s.me {
+			continue
+		}
+		wg.Go(func() {
+			lastLogIndex, lastLogTerm := s.lastLog()
+			reply, _ := s.requestVote(context.Background(), p, requestVoteArgs{
+				Term:         s.currentTerm,
+				CandidateID:  s.me,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			})
+			replies[p] = reply
+		})
+	}
+	wg.Wait()
+
+	// handle vote results
+	count, total := 1, len(s.peers)
+	for _, re := range replies {
+		if re.Term > s.currentTerm {
+			s.state = follower
+			s.votedFor = ""
+			s.currentTerm = re.Term
+			s.resetElectionTimer()
+			return
+		}
+		if re.VoteGranted {
+			count++
+		}
+	}
+	if majority(count, total) {
+		s.becomeLeader()
+	}
+}
+
+func (s *server) handleTimeout() {
+	if s.state == leader {
+		return
+	}
+	s.startElection()
+}
+
 // run is the starting point for election timers, heartbeats, and applying
 // committed entries.
 func (s *server) run() {
 	defer close(s.done)
-	<-s.stopCh
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-s.timer.C:
+			s.handleTimeout()
+		}
+	}
+
 }
 
 func (s *server) stop() {
@@ -255,4 +350,8 @@ func (s *server) resetElectionTimer() {
 
 func randomElectionTimeout() time.Duration {
 	return minElectionTimeout + time.Duration(rand.Int63n(int64(maxElectionTimeout-minElectionTimeout)))
+}
+
+func majority(count, total int) bool {
+	return count >= total/2+1
 }
