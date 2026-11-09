@@ -154,13 +154,16 @@ What
 - Not a library, this is a lab simulating Raft cluster
 
 Steps (focus on Raft logic first, then cluster and simulation logic later)
-- Define server state
-- Implement election timer
-- Implement RequestVote RPC request & response
-- Implement AppendEntries RPC request & response
-- Manage persistent state & inject to server when reboot
-- Define cluster
-- Define RPC as channel
+- Define server state: my work
+- Implement election timer: my work
+- Implement RequestVote RPC request & response: my work
+- Implement AppendEntries RPC request & response: my work
+- Manage persistent state & inject to server when reboot: agent work
+- Define cluster: agent work
+- Define RPC as channel: agent work
+
+How to sync between goroutines, states?
+- During sending vote RPC, can receive valid RPC from other server? Do need to stop sending? What to do at that moment? 
 
 ## Test
 
