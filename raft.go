@@ -110,7 +110,7 @@ func (s *server) lastLog() (index, term int) {
 }
 
 func (s *server) beLeader() {
-	s.mu.Lock()
+	// assume already lock
 	s.state = leader
 	lastLogIndex, _ := s.lastLog()
 	for _, p := range s.peers {
@@ -199,8 +199,9 @@ func (s *server) candidateDoElection() {
 					count++
 				}
 				if majority(count, total) {
-					s.mu.Unlock()
+					// beLeader needs to be atomic duing check & transition
 					s.beLeader()
+					s.mu.Unlock()
 				}
 			} else {
 				s.mu.Unlock()
