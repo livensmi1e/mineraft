@@ -109,7 +109,7 @@ func (s *server) lastLog() (index, term int) {
 	return index, s.log[index-1].Term
 }
 
-func (s *server) becomeLeader() {
+func (s *server) doLeader() {
 	s.state = leader
 
 	lastLogIndex, _ := s.lastLog()
@@ -142,11 +142,7 @@ func (s *server) becomeLeader() {
 	wg.Wait()
 }
 
-func (s *server) startElection() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// start election
+func (s *server) doCandidate() {
 	s.currentTerm++
 	s.state = candidate
 	s.votedFor = s.me
@@ -185,15 +181,23 @@ func (s *server) startElection() {
 		}
 	}
 	if majority(count, total) {
-		s.becomeLeader()
+		s.doLeader()
 	}
+}
+
+func (s *server) doElection() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// start election, become candidate
+	s.doCandidate()
 }
 
 func (s *server) handleTimeout() {
 	if s.state == leader {
 		return
 	}
-	s.startElection()
+	s.doElection()
 }
 
 // run is the starting point for election timers, heartbeats, and applying
