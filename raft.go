@@ -109,39 +109,39 @@ func (s *server) lastLog() (index, term int) {
 	return index, s.log[index-1].Term
 }
 
-func (s *server) beLeader() {
-	// assume already lock
-	s.state = leader
-	lastLogIndex, _ := s.lastLog()
-	for _, p := range s.peers {
-		if p == s.me {
-			continue
-		}
-		s.nextIndex[p] = lastLogIndex + 1
-		s.matchIndex[p] = 0
-	}
+func (s *server) leaderDoWork() {
+	s.mu.Lock()
+	currentTerm := s.currentTerm
+	lastLogIndex, lastLogTerm := s.lastLog()
+	commitIndex := s.commitIndex
 	s.mu.Unlock()
 
-	var wg sync.WaitGroup
 	for _, p := range s.peers {
 		if p == s.me {
 			continue
 		}
-		wg.Go(func() {
-			lastLogIndex, lastLogTerm := s.lastLog()
+		go func() {
 			reply, _ := s.appendEntries(context.Background(), p, appendEntriesArgs{
-				Term:         s.currentTerm,
+				Term:         currentTerm,
 				LeaderID:     s.me,
 				PrevLogIndex: lastLogIndex,
 				PrevLogTerm:  lastLogTerm,
-				LeaderCommit: s.commitIndex,
+				LeaderCommit: commitIndex,
 			})
 
 			// todo: process reply
-			reply.Term++
-		})
+			s.mu.Lock()
+			if reply.Term > s.currentTerm {
+				s.state = follower
+				s.votedFor = ""
+				s.currentTerm = reply.Term
+				s.resetElectionTimer()
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+		}()
 	}
-	wg.Wait()
 }
 
 // Locked:
@@ -169,14 +169,17 @@ func (s *server) candidateDoElection() {
 
 	lastLogIndex, lastLogTerm := s.lastLog()
 	electionTerm := s.currentTerm
-	count, total := 1, len(s.peers)
 	s.mu.Unlock()
+
+	count, total := 1, len(s.peers)
 
 	for _, p := range s.peers {
 		if p == s.me {
 			continue
 		}
 		go func() {
+			becameLeader := false
+
 			reply, _ := s.requestVote(context.Background(), p, requestVoteArgs{
 				Term:         electionTerm,
 				CandidateID:  s.me, // me never change, safe
@@ -193,19 +196,29 @@ func (s *server) candidateDoElection() {
 				s.mu.Unlock()
 				return
 			}
-			valid := s.validCandidateInElection(electionTerm)
+			valid := s.state == candidate && electionTerm == s.currentTerm
 			if valid {
 				if reply.VoteGranted {
 					count++
 				}
 				if majority(count, total) {
-					// beLeader needs to be atomic duing check & transition
-					s.beLeader()
-					s.mu.Unlock()
+					// transition to leader, be atomic
+					s.state = leader
+					lastLogIndex, _ := s.lastLog()
+					for _, p := range s.peers {
+						if p == s.me {
+							continue
+						}
+						s.nextIndex[p] = lastLogIndex + 1
+						s.matchIndex[p] = 0
+					}
+					becameLeader = true
 				}
-			} else {
-				s.mu.Unlock()
-				return // stale
+			}
+			s.mu.Unlock()
+
+			if becameLeader {
+				s.leaderDoWork()
 			}
 		}()
 	}
@@ -372,11 +385,6 @@ func (s *server) resetElectionTimer() {
 		}
 	}
 	s.timer.Reset(randomElectionTimeout())
-}
-
-// assume lock is acquired
-func (s *server) validCandidateInElection(electionTerm int) bool {
-	return s.state == candidate && electionTerm == s.currentTerm
 }
 
 func randomElectionTimeout() time.Duration {
