@@ -109,38 +109,63 @@ func (s *server) lastLog() (index, term int) {
 	return index, s.log[index-1].Term
 }
 
-func (s *server) leaderDoWork() {
+func (s *server) leaderDoWork(leaderTerm int) {
 	s.mu.Lock()
+	if s.state != leader {
+		s.mu.Unlock()
+		return
+	}
 	currentTerm := s.currentTerm
 	lastLogIndex, lastLogTerm := s.lastLog()
 	commitIndex := s.commitIndex
 	s.mu.Unlock()
 
+	var sendAppendEntries func(peer id)
+	sendAppendEntries = func(peer id) {
+		request := appendEntriesArgs{
+			Term:         currentTerm,
+			LeaderID:     s.me,
+			PrevLogIndex: lastLogIndex,
+			PrevLogTerm:  lastLogTerm,
+			LeaderCommit: commitIndex,
+		}
+		s.mu.Lock()
+		if lastLogIndex >= s.nextIndex[peer] {
+			request.Entries = s.log[s.nextIndex[peer]-1:]
+		}
+		s.mu.Unlock()
+		reply, _ := s.appendEntries(context.Background(), peer, request)
+
+		s.mu.Lock()
+		if reply.Term > s.currentTerm {
+			s.state = follower
+			s.votedFor = ""
+			s.currentTerm = reply.Term
+			s.resetElectionTimer()
+			s.mu.Unlock()
+			return
+		}
+		valid := s.state == leader && s.currentTerm == leaderTerm
+		if !valid {
+			s.mu.Unlock()
+			return
+		}
+		if reply.Success {
+			// do what?
+		} else {
+			s.nextIndex[peer]--
+			s.mu.Unlock()
+			go sendAppendEntries(peer) // retry
+		}
+		s.mu.Unlock()
+	}
+
+	// send initial heartbeats to init authority
 	for _, p := range s.peers {
 		if p == s.me {
 			continue
 		}
-		go func() {
-			reply, _ := s.appendEntries(context.Background(), p, appendEntriesArgs{
-				Term:         currentTerm,
-				LeaderID:     s.me,
-				PrevLogIndex: lastLogIndex,
-				PrevLogTerm:  lastLogTerm,
-				LeaderCommit: commitIndex,
-			})
-
-			// todo: process reply
-			s.mu.Lock()
-			if reply.Term > s.currentTerm {
-				s.state = follower
-				s.votedFor = ""
-				s.currentTerm = reply.Term
-				s.resetElectionTimer()
-				s.mu.Unlock()
-				return
-			}
-			s.mu.Unlock()
-		}()
+		go sendAppendEntries(p)
 	}
 }
 
@@ -178,8 +203,6 @@ func (s *server) candidateDoElection() {
 			continue
 		}
 		go func() {
-			becameLeader := false
-
 			reply, _ := s.requestVote(context.Background(), p, requestVoteArgs{
 				Term:         electionTerm,
 				CandidateID:  s.me, // me never change, safe
@@ -196,30 +219,30 @@ func (s *server) candidateDoElection() {
 				s.mu.Unlock()
 				return
 			}
-			valid := s.state == candidate && electionTerm == s.currentTerm
-			if valid {
-				if reply.VoteGranted {
-					count++
-				}
-				if majority(count, total) {
-					// transition to leader, be atomic
-					s.state = leader
-					lastLogIndex, _ := s.lastLog()
-					for _, p := range s.peers {
-						if p == s.me {
-							continue
-						}
-						s.nextIndex[p] = lastLogIndex + 1
-						s.matchIndex[p] = 0
+			valid := s.state == candidate && s.currentTerm == electionTerm
+			if !valid {
+				s.mu.Unlock()
+				return
+			}
+			if reply.VoteGranted {
+				count++
+			}
+			if majority(count, total) {
+				// transition to leader, be atomic
+				s.state = leader
+				lastLogIndex, _ := s.lastLog()
+				for _, p := range s.peers {
+					if p == s.me {
+						continue
 					}
-					becameLeader = true
+					s.nextIndex[p] = lastLogIndex + 1
+					s.matchIndex[p] = 0
 				}
+				s.mu.Unlock()
+				s.leaderDoWork(electionTerm)
+				return
 			}
 			s.mu.Unlock()
-
-			if becameLeader {
-				s.leaderDoWork()
-			}
 		}()
 	}
 }
@@ -305,7 +328,7 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 	// valid leader request, reset timer
 	s.resetElectionTimer()
 
-	if s.state == candidate {
+	if s.state == candidate || s.state == leader {
 		s.state = follower
 	}
 	if args.Term > s.currentTerm {
@@ -392,5 +415,8 @@ func randomElectionTimeout() time.Duration {
 }
 
 func majority(count, total int) bool {
+	if total == 1 {
+		return true
+	}
 	return count >= total/2+1
 }
