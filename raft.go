@@ -169,27 +169,20 @@ func (s *server) leaderDoWork(leaderTerm int) {
 			s.matchIndex[peer] = max(s.matchIndex[peer], lastReplicatedIndex)
 			s.nextIndex[peer] = max(s.nextIndex[peer], lastReplicatedIndex+1)
 
-			N := -1
-			for i := range slices.Backward(s.log) {
-				if N <= s.commitIndex {
-					break
+			for N := len(s.log); N >= s.commitIndex+1; N-- {
+				if s.log[N-1].Term != s.currentTerm {
+					continue
 				}
-				if s.log[i].Term != s.currentTerm {
-					break
-				}
-				N = i + 1
-				count := 0
+				count := 1
 				for _, val := range s.matchIndex {
 					if val >= N {
 						count++
 					}
 				}
 				if majority(count, len(s.peers)) {
+					s.commitIndex = N
 					break
 				}
-			}
-			if N != -1 {
-				s.commitIndex = N
 			}
 		} else {
 			if s.nextIndex[peer] > 1 {
