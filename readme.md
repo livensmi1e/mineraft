@@ -162,12 +162,14 @@ Steps (focus on Raft logic first, then cluster and simulation logic later)
 - Manage persistent state & inject to server when reboot: agent work
 - Define cluster: agent work
 - Define RPC as channel: agent work
-- Implement leader serve client request, log replication, commit, apply
-- Implement periodic heartbeat
+- Implement leader serve client request, append entry request, log replication, commit, apply: my work
+- Implement periodic heartbeat: my work
 
 How to sync between goroutines, states?
 - Using mutex or actor model? --> Mutex is too hard for me and error prone!
 - During sending vote RPC, can receive valid RPC from other server? Do need to stop sending? What to do at that moment? 
+
+The hard thing is determine which operation is atomic?
 
 ## Test
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 )
@@ -76,6 +77,8 @@ type server struct {
 	votedFor    id
 	log         []logEntry
 
+	db []string
+
 	timer  *time.Timer
 	stopCh chan struct{}
 	done   chan struct{}
@@ -87,11 +90,12 @@ func newServer(me id, peers []id, transport *network, currentTerm int, votedFor 
 		peers:       append([]id(nil), peers...),
 		state:       follower,
 		transport:   transport,
-		nextIndex:   make(map[id]int),
+		nextIndex:   make(map[id]int), // 1 <= nextIndex <= len(log)+1
 		matchIndex:  make(map[id]int),
 		currentTerm: currentTerm,
 		votedFor:    votedFor,
 		log:         append([]logEntry(nil), log...),
+		db:          make([]string, 0),
 		timer:       time.NewTimer(randomElectionTimeout()),
 		stopCh:      make(chan struct{}),
 		done:        make(chan struct{}),
@@ -111,30 +115,39 @@ func (s *server) lastLog() (index, term int) {
 
 func (s *server) leaderDoWork(leaderTerm int) {
 	s.mu.Lock()
-	if s.state != leader {
+	if !(s.state == leader && s.currentTerm == leaderTerm) {
 		s.mu.Unlock()
 		return
 	}
 	currentTerm := s.currentTerm
-	lastLogIndex, lastLogTerm := s.lastLog()
+	lastLogIndex, _ := s.lastLog()
 	commitIndex := s.commitIndex
 	s.mu.Unlock()
 
 	var sendAppendEntries func(peer id)
 	sendAppendEntries = func(peer id) {
+		s.mu.Lock()
+		prevLogIndex, prevLogTerm := s.nextIndex[peer]-1, -1
+		if prevLogIndex >= 1 {
+			prevLogTerm = s.log[prevLogIndex-1].Term
+		}
 		request := appendEntriesArgs{
 			Term:         currentTerm,
 			LeaderID:     s.me,
-			PrevLogIndex: lastLogIndex,
-			PrevLogTerm:  lastLogTerm,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
 			LeaderCommit: commitIndex,
 		}
-		s.mu.Lock()
 		if lastLogIndex >= s.nextIndex[peer] {
-			request.Entries = s.log[s.nextIndex[peer]-1:]
+			request.Entries = slices.Clone(s.log[s.nextIndex[peer]-1:])
 		}
 		s.mu.Unlock()
-		reply, _ := s.appendEntries(context.Background(), peer, request)
+
+		reply, err := s.appendEntries(context.Background(), peer, request)
+		if err != nil {
+			sendAppendEntries(peer) // retry
+			return
+		}
 
 		s.mu.Lock()
 		if reply.Term > s.currentTerm {
@@ -151,11 +164,40 @@ func (s *server) leaderDoWork(leaderTerm int) {
 			return
 		}
 		if reply.Success {
-			// do what?
+			lastReplicatedIndex := request.PrevLogIndex + len(request.Entries)
+			// use max because 2nd request may be responded 1st
+			s.matchIndex[peer] = max(s.matchIndex[peer], lastReplicatedIndex)
+			s.nextIndex[peer] = max(s.nextIndex[peer], lastReplicatedIndex+1)
+
+			N := -1
+			for i := range slices.Backward(s.log) {
+				if N <= s.commitIndex {
+					break
+				}
+				if s.log[i].Term != s.currentTerm {
+					break
+				}
+				N = i + 1
+				count := 0
+				for _, val := range s.matchIndex {
+					if val >= N {
+						count++
+					}
+				}
+				if majority(count, len(s.peers)) {
+					break
+				}
+			}
+			if N != -1 {
+				s.commitIndex = N
+			}
 		} else {
-			s.nextIndex[peer]--
+			if s.nextIndex[peer] > 1 {
+				s.nextIndex[peer]--
+			}
 			s.mu.Unlock()
-			go sendAppendEntries(peer) // retry
+			sendAppendEntries(peer)
+			return
 		}
 		s.mu.Unlock()
 	}
@@ -250,11 +292,11 @@ func (s *server) candidateDoElection() {
 func (s *server) handleTimeout() {
 	s.mu.RLock()
 	state := s.state
-	s.mu.RUnlock()
-
 	if state == leader {
+		s.mu.RUnlock()
 		return
 	}
+	s.mu.RUnlock()
 	s.candidateDoElection()
 }
 
@@ -415,8 +457,5 @@ func randomElectionTimeout() time.Duration {
 }
 
 func majority(count, total int) bool {
-	if total == 1 {
-		return true
-	}
 	return count >= total/2+1
 }
