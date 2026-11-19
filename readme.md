@@ -165,6 +165,7 @@ Steps (focus on Raft logic first, then cluster and simulation logic later)
 - Implement leader serve client request, append entry request, log replication, commit, apply: my work
 - Implement periodic heartbeat: my work
 - Refactor sync pattern: agent + my work
+- Testing: agent
 
 Work of leader
 - Log replication
@@ -176,10 +177,11 @@ How to sync between goroutines, states?
 
 The hard thing is determine which operation is atomic?
 
-## Problems while implementing
+### Problems while implementing
 - Operation hard to reason about (atomicity, ordering,...): eg. leader transition when winning election
 - Stale state: eg. leader doing its work, but then it becomes follower, have to check almost everytime
 - Missing details that paper not explicit shows
+- 
 
 ## Test
 

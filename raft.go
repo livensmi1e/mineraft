@@ -146,7 +146,7 @@ func (s *server) replicateLogs(leaderTerm int) {
 
 		reply, err := s.appendEntries(context.Background(), peer, request)
 		if err != nil {
-			sendAppendEntries(peer) // retry
+			sendAppendEntries(peer) // retry, stack overflow
 			return
 		}
 
@@ -182,6 +182,7 @@ func (s *server) replicateLogs(leaderTerm int) {
 				}
 				if majority(count, len(s.peers)) {
 					s.commitIndex = N
+					s.applyCommittedLocked()
 					break
 				}
 			}
@@ -205,17 +206,11 @@ func (s *server) replicateLogs(leaderTerm int) {
 	}
 }
 
-func (s *server) applyToStateMachine(leaderTerm int) {
-	s.mu.Lock()
-	if !(s.state == leader && s.currentTerm == leaderTerm) {
-		s.mu.Unlock()
-		return
-	}
+func (s *server) applyCommittedLocked() {
 	for s.lastApplied < s.commitIndex {
 		s.lastApplied++
 		s.db = append(s.db, s.log[s.lastApplied-1].Command)
 	}
-	s.mu.Unlock()
 }
 
 // Locked:
@@ -357,12 +352,12 @@ func (s *server) Start(command string) (index int, term int, isLeader bool) {
 		s.mu.Unlock()
 		return -1, -1, false
 	}
-	currentTerm := s.currentTerm
-	s.log = append(s.log, logEntry{Term: currentTerm, Command: command})
+	term = s.currentTerm
+	index = len(s.log)
+	s.log = append(s.log, logEntry{Term: term, Command: command})
 	s.mu.Unlock()
-	s.replicateLogs(currentTerm)
-	s.applyToStateMachine(currentTerm)
-	return len(s.log), s.currentTerm, true
+	s.replicateLogs(term)
+	return index, term, true
 }
 
 // RequestVote is called concurrently by the simulated network.
@@ -446,6 +441,7 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 	if args.LeaderCommit > s.commitIndex {
 		lastNewEntryIndex := len(args.Entries) + args.PrevLogIndex
 		s.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
+		s.applyCommittedLocked()
 	}
 
 	return appendEntriesReply{Term: s.currentTerm, Success: true}, nil
