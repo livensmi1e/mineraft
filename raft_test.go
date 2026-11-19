@@ -500,3 +500,264 @@ func callAppendEntries(t *testing.T, s *server, args appendEntriesArgs) (appendE
 		return appendEntriesReply{}, nil
 	}
 }
+
+func TestAppendEntriesAppliesCommittedEntries(t *testing.T) {
+	s := newUnitServer(t, follower, 3, "", []logEntry{
+		{Command: "x=1", Term: 1},
+		{Command: "y=2", Term: 3},
+	})
+
+	_, err := s.AppendEntries(context.Background(), appendEntriesArgs{
+		Term:         3,
+		LeaderID:     "S2",
+		PrevLogIndex: 2,
+		PrevLogTerm:  3,
+		LeaderCommit: 2,
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries returned error: %v", err)
+	}
+
+	if s.commitIndex != 2 {
+		t.Errorf("commitIndex = %d, want 2", s.commitIndex)
+	}
+	if s.lastApplied != 2 {
+		t.Errorf("lastApplied = %d, want 2", s.lastApplied)
+	}
+	wantDB := []string{"x=1", "y=2"}
+	if !reflect.DeepEqual(s.db, wantDB) {
+		t.Errorf("db = %v, want %v", s.db, wantDB)
+	}
+}
+
+func TestAppendEntriesDoesNotApplyUncommittedEntry(t *testing.T) {
+	s := newUnitServer(t, follower, 3, "", nil)
+
+	_, err := s.AppendEntries(context.Background(), appendEntriesArgs{
+		Term:     3,
+		LeaderID: "S2",
+		Entries:  []logEntry{{Command: "x=1", Term: 3}},
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries returned error: %v", err)
+	}
+
+	if s.commitIndex != 0 || s.lastApplied != 0 {
+		t.Errorf("commitIndex, lastApplied = %d, %d; want 0, 0", s.commitIndex, s.lastApplied)
+	}
+	if len(s.db) != 0 {
+		t.Errorf("db = %v, want no applied commands", s.db)
+	}
+}
+
+func TestStart(t *testing.T) {
+	t.Run("leader appends but does not apply before commit", func(t *testing.T) {
+		s := newUnitServer(t, leader, 4, "S1", []logEntry{{Command: "x=1", Term: 3}})
+		s.peers = []id{"S1"}
+
+		index, term, isLeader := s.Start("y=2")
+
+		if !isLeader {
+			t.Fatal("Start reported isLeader = false, want true")
+		}
+		if index != 2 || term != 4 {
+			t.Errorf("Start() = (%d, %d, true), want (2, 4, true)", index, term)
+		}
+		wantLog := []logEntry{{Command: "x=1", Term: 3}, {Command: "y=2", Term: 4}}
+		if !reflect.DeepEqual(s.log, wantLog) {
+			t.Errorf("log = %+v, want %+v", s.log, wantLog)
+		}
+		if s.commitIndex != 0 || s.lastApplied != 0 || len(s.db) != 0 {
+			t.Errorf("uncommitted command changed state machine: commitIndex=%d lastApplied=%d db=%v", s.commitIndex, s.lastApplied, s.db)
+		}
+	})
+
+	t.Run("non-leader rejects command without changing log", func(t *testing.T) {
+		s := newUnitServer(t, follower, 4, "", []logEntry{{Command: "x=1", Term: 3}})
+
+		index, term, isLeader := s.Start("y=2")
+
+		if isLeader || index != -1 || term != -1 {
+			t.Errorf("Start() = (%d, %d, %t), want (-1, -1, false)", index, term, isLeader)
+		}
+		wantLog := []logEntry{{Command: "x=1", Term: 3}}
+		if !reflect.DeepEqual(s.log, wantLog) {
+			t.Errorf("log = %+v, want %+v", s.log, wantLog)
+		}
+	})
+}
+
+func TestCandidateElectionBecomesLeaderAndInitializesReplicationState(t *testing.T) {
+	leaderServer, followers := newRaftTestCluster(t, 0, nil)
+
+	leaderServer.candidateDoElection()
+
+	waitForCondition(t, "candidate to become leader", func() bool {
+		leaderServer.mu.RLock()
+		defer leaderServer.mu.RUnlock()
+		return leaderServer.state == leader
+	})
+
+	leaderServer.mu.RLock()
+	if leaderServer.currentTerm != 1 {
+		t.Errorf("currentTerm = %d, want 1", leaderServer.currentTerm)
+	}
+	if leaderServer.votedFor != leaderServer.me {
+		t.Errorf("votedFor = %q, want %q", leaderServer.votedFor, leaderServer.me)
+	}
+	for _, follower := range followers {
+		if leaderServer.nextIndex[follower.me] != 1 {
+			t.Errorf("nextIndex[%s] = %d, want 1", follower.me, leaderServer.nextIndex[follower.me])
+		}
+		if leaderServer.matchIndex[follower.me] != 0 {
+			t.Errorf("matchIndex[%s] = %d, want 0", follower.me, leaderServer.matchIndex[follower.me])
+		}
+	}
+	leaderServer.mu.RUnlock()
+}
+
+func TestReplicationCommitsAppliesAndPropagatesCommit(t *testing.T) {
+	entries := []logEntry{
+		{Command: "old=1", Term: 2},
+		{Command: "x=1", Term: 3},
+	}
+	leaderServer, followers := newRaftTestCluster(t, 3, entries)
+
+	leaderServer.replicateLogs(3)
+
+	waitForCondition(t, "leader to commit and apply entry", func() bool {
+		leaderServer.mu.RLock()
+		defer leaderServer.mu.RUnlock()
+		return leaderServer.commitIndex == 2 && leaderServer.lastApplied == 2
+	})
+
+	leaderServer.mu.RLock()
+	if !reflect.DeepEqual(leaderServer.db, []string{"old=1", "x=1"}) {
+		t.Errorf("leader db = %v, want [old=1 x=1]", leaderServer.db)
+	}
+	leaderServer.mu.RUnlock()
+
+	// The first round carried LeaderCommit = 0. A later heartbeat delivers the
+	// commit decision to followers.
+	leaderServer.replicateLogs(3)
+
+	waitForCondition(t, "followers to apply committed entry", func() bool {
+		for _, follower := range followers {
+			follower.mu.RLock()
+			ready := follower.commitIndex == 2 && follower.lastApplied == 2
+			follower.mu.RUnlock()
+			if !ready {
+				return false
+			}
+		}
+		return true
+	})
+
+	for _, follower := range followers {
+		follower.mu.RLock()
+		if !reflect.DeepEqual(follower.log, entries) {
+			t.Errorf("%s log = %+v, want %+v", follower.me, follower.log, entries)
+		}
+		if !reflect.DeepEqual(follower.db, []string{"old=1", "x=1"}) {
+			t.Errorf("%s db = %v, want [old=1 x=1]", follower.me, follower.db)
+		}
+		follower.mu.RUnlock()
+	}
+}
+
+func TestLeaderDoesNotDirectlyCommitPriorTermEntry(t *testing.T) {
+	leaderServer, followers := newRaftTestCluster(t, 3, []logEntry{{Command: "x=1", Term: 2}})
+
+	leaderServer.replicateLogs(3)
+
+	waitForCondition(t, "followers to replicate prior-term entry", func() bool {
+		for _, follower := range followers {
+			follower.mu.RLock()
+			matched := len(follower.log) == 1
+			follower.mu.RUnlock()
+			if !matched {
+				return false
+			}
+		}
+		return true
+	})
+
+	leaderServer.mu.RLock()
+	defer leaderServer.mu.RUnlock()
+	if leaderServer.commitIndex != 0 {
+		t.Errorf("commitIndex = %d, want 0: prior-term entries cannot be directly committed", leaderServer.commitIndex)
+	}
+	if leaderServer.lastApplied != 0 || len(leaderServer.db) != 0 {
+		t.Errorf("prior-term entry was applied: lastApplied=%d db=%v", leaderServer.lastApplied, leaderServer.db)
+	}
+}
+
+// newRaftTestCluster creates stopped servers so tests can exercise Raft logic
+// through the real, reliable in-memory transport without election timers.
+func newRaftTestCluster(t *testing.T, term int, entries []logEntry) (*server, []*server) {
+	t.Helper()
+
+	ids := []id{"S1", "S2", "S3"}
+	events := newEventHub()
+	network := newNetwork(1, events)
+	t.Cleanup(func() {
+		network.close()
+		events.close()
+	})
+
+	leaderServer := newStoppedTestServer(t, "S1", ids, leader, term, "", entries, network)
+	followers := []*server{
+		newStoppedTestServer(t, "S2", ids, follower, term, "", nil, network),
+		newStoppedTestServer(t, "S3", ids, follower, term, "", nil, network),
+	}
+	for _, server := range append([]*server{leaderServer}, followers...) {
+		if err := network.register(server.me, server); err != nil {
+			t.Fatalf("register %s: %v", server.me, err)
+		}
+	}
+
+	for _, follower := range followers {
+		leaderServer.nextIndex[follower.me] = len(entries) + 1
+		leaderServer.matchIndex[follower.me] = 0
+	}
+	return leaderServer, followers
+}
+
+func newStoppedTestServer(t *testing.T, me id, peers []id, role state, term int, votedFor id, entries []logEntry, transport *network) *server {
+	t.Helper()
+
+	timer := time.NewTimer(time.Hour)
+	t.Cleanup(func() { timer.Stop() })
+	return &server{
+		me:          me,
+		peers:       append([]id(nil), peers...),
+		state:       role,
+		transport:   transport,
+		currentTerm: term,
+		votedFor:    votedFor,
+		log:         append([]logEntry(nil), entries...),
+		nextIndex:   make(map[id]int),
+		matchIndex:  make(map[id]int),
+		timer:       timer,
+	}
+}
+
+func waitForCondition(t *testing.T, description string, condition func() bool) {
+	t.Helper()
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if condition() {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for %s", description)
+		case <-ticker.C:
+		}
+	}
+}

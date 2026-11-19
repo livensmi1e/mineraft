@@ -353,8 +353,8 @@ func (s *server) Start(command string) (index int, term int, isLeader bool) {
 		return -1, -1, false
 	}
 	term = s.currentTerm
-	index = len(s.log)
 	s.log = append(s.log, logEntry{Term: term, Command: command})
+	index = len(s.log)
 	s.mu.Unlock()
 	s.replicateLogs(term)
 	return index, term, true
