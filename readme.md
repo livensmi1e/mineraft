@@ -164,12 +164,22 @@ Steps (focus on Raft logic first, then cluster and simulation logic later)
 - Define RPC as channel: agent work
 - Implement leader serve client request, append entry request, log replication, commit, apply: my work
 - Implement periodic heartbeat: my work
+- Refactor sync pattern: agent + my work
+
+Work of leader
+- Log replication
+- Periodic heartbeat: how? use Go ticker
 
 How to sync between goroutines, states?
 - Using mutex or actor model? --> Mutex is too hard for me and error prone!
 - During sending vote RPC, can receive valid RPC from other server? Do need to stop sending? What to do at that moment? 
 
 The hard thing is determine which operation is atomic?
+
+## Problems while implementing
+- Operation hard to reason about (atomicity, ordering,...): eg. leader transition when winning election
+- Stale state: eg. leader doing its work, but then it becomes follower, have to check almost everytime
+- Missing details that paper not explicit shows
 
 ## Test
 

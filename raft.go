@@ -19,6 +19,7 @@ const (
 const (
 	minElectionTimeout = 150 * time.Millisecond
 	maxElectionTimeout = 300 * time.Millisecond
+	heartbeatInterval  = 50 * time.Millisecond // why 50ms
 )
 
 type id string
@@ -113,7 +114,7 @@ func (s *server) lastLog() (index, term int) {
 	return index, s.log[index-1].Term
 }
 
-func (s *server) leaderDoWork(leaderTerm int) {
+func (s *server) replicateLogs(leaderTerm int) {
 	s.mu.Lock()
 	if !(s.state == leader && s.currentTerm == leaderTerm) {
 		s.mu.Unlock()
@@ -189,7 +190,7 @@ func (s *server) leaderDoWork(leaderTerm int) {
 				s.nextIndex[peer]--
 			}
 			s.mu.Unlock()
-			sendAppendEntries(peer)
+			sendAppendEntries(peer) // stack overflow
 			return
 		}
 		s.mu.Unlock()
@@ -200,8 +201,21 @@ func (s *server) leaderDoWork(leaderTerm int) {
 		if p == s.me {
 			continue
 		}
-		go sendAppendEntries(p)
+		go sendAppendEntries(p) // goroutine?
 	}
+}
+
+func (s *server) applyToStateMachine(leaderTerm int) {
+	s.mu.Lock()
+	if !(s.state == leader && s.currentTerm == leaderTerm) {
+		s.mu.Unlock()
+		return
+	}
+	for s.lastApplied < s.commitIndex {
+		s.lastApplied++
+		s.db = append(s.db, s.log[s.lastApplied-1].Command)
+	}
+	s.mu.Unlock()
 }
 
 // Locked:
@@ -274,7 +288,7 @@ func (s *server) candidateDoElection() {
 					s.matchIndex[p] = 0
 				}
 				s.mu.Unlock()
-				s.leaderDoWork(electionTerm)
+				s.replicateLogs(electionTerm) // goroutine?
 				return
 			}
 			s.mu.Unlock()
@@ -297,12 +311,24 @@ func (s *server) handleTimeout() {
 // committed entries.
 func (s *server) run() {
 	defer close(s.done)
+
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-s.stopCh:
 			return
 		case <-s.timer.C:
 			s.handleTimeout()
+		case <-ticker.C:
+			s.mu.RLock()
+			isLeader := s.state == leader
+			term := s.currentTerm
+			s.mu.RUnlock()
+			if isLeader {
+				s.replicateLogs(term) // goroutine?
+			}
 		}
 	}
 
@@ -322,6 +348,21 @@ func (s *server) stop() {
 		default:
 		}
 	}
+}
+
+// Start is called by client
+func (s *server) Start(command string) (index int, term int, isLeader bool) {
+	s.mu.Lock()
+	if s.state != leader {
+		s.mu.Unlock()
+		return -1, -1, false
+	}
+	currentTerm := s.currentTerm
+	s.log = append(s.log, logEntry{Term: currentTerm, Command: command})
+	s.mu.Unlock()
+	s.replicateLogs(currentTerm)
+	s.applyToStateMachine(currentTerm)
+	return len(s.log), s.currentTerm, true
 }
 
 // RequestVote is called concurrently by the simulated network.
