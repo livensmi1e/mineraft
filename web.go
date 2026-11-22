@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -37,6 +38,7 @@ func newWebHandler(cluster *cluster) http.Handler {
 	mux.HandleFunc("GET /api/events", app.events)
 	mux.HandleFunc("POST /api/network", app.configureNetwork)
 	mux.HandleFunc("POST /api/nodes", app.configureNode)
+	mux.HandleFunc("POST /api/commands", app.submitCommand)
 	return mux
 }
 
@@ -113,6 +115,30 @@ func (a *webApp) configureNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, a.cluster.snapshot())
+}
+
+func (a *webApp) submitCommand(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Command string `json:"command"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if strings.TrimSpace(input.Command) == "" {
+		writeError(w, http.StatusBadRequest, "command is required")
+		return
+	}
+
+	leader, index, term, err := a.cluster.submit(input.Command)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, struct {
+		Leader id  `json:"leader"`
+		Index  int `json:"index"`
+		Term   int `json:"term"`
+	}{Leader: leader, Index: index, Term: term})
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {

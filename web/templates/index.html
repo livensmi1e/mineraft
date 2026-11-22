@@ -18,7 +18,15 @@
 
   <main>
     <section class="controls" aria-label="Network controls">
-      <p>Click a node to isolate or reconnect it.</p>
+      <p>Click a node to inspect it.</p>
+      <form id="command-form" class="command-form">
+        <label>
+          Command
+          <input id="command-input" name="command" autocomplete="off" placeholder="set x=1" required>
+        </label>
+        <button type="submit">Send</button>
+        <span id="command-status" class="command-status" aria-live="polite"></span>
+      </form>
       <label>
         Network
         <select id="network-mode">
@@ -65,8 +73,10 @@
           <div><dt>Commit index</dt><dd>—</dd></div>
           <div><dt>Last applied</dt><dd>—</dd></div>
         </dl>
+        <button id="node-action" class="node-action" type="button" hidden></button>
 
         <h3 class="event-heading">RPC events</h3>
+        <p class="event-note">Heartbeat traffic stays on the graph.</p>
         <ol id="event-list" class="event-list" aria-live="polite" aria-label="RPC events">
           <li class="empty-event">No notable RPCs yet.</li>
         </ol>

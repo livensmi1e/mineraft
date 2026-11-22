@@ -19,7 +19,7 @@ func TestIndexUsesEnglishCopy(t *testing.T) {
 	newWebHandler(cluster).ServeHTTP(response, request)
 
 	body := response.Body.String()
-	if !strings.Contains(body, `<html lang="en">`) || !strings.Contains(body, "Click a node to isolate or reconnect it.") {
+	if !strings.Contains(body, `<html lang="en">`) || !strings.Contains(body, "Click a node to inspect it.") {
 		t.Fatal("index does not contain the expected English copy")
 	}
 }
@@ -50,6 +50,36 @@ func TestNewClusterStartsInReliableNetworkMode(t *testing.T) {
 
 	if cluster.snapshot().Network.Mode != reliableNetwork {
 		t.Fatalf("network mode = %q, want %q", cluster.snapshot().Network.Mode, reliableNetwork)
+	}
+}
+
+func TestSubmitCommandAppendsToLeader(t *testing.T) {
+	cluster, err := newCluster([]id{"S1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cluster.close()
+
+	leader := cluster.servers["S1"]
+	leader.mu.Lock()
+	leader.currentTerm = 1
+	leader.becomeLeaderLocked()
+	leader.mu.Unlock()
+
+	request := httptest.NewRequest(http.MethodPost, "/api/commands", strings.NewReader(`{"command":"set x=1"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	newWebHandler(cluster).ServeHTTP(response, request)
+
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
+	}
+	log := leader.snapshot().Log
+	if len(log) != 1 {
+		t.Fatal("leader did not append the command")
+	}
+	if log[0] != (logEntry{Command: "set x=1", Term: 1}) {
+		t.Fatalf("log entry = %+v, want command and term", log[0])
 	}
 }
 

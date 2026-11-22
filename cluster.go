@@ -72,6 +72,18 @@ func (c *cluster) close() {
 	c.events.close()
 }
 
+// submit asks the current leader to append a client command. Acceptance only
+// means the leader appended it locally; Raft commits it later after replication.
+func (c *cluster) submit(command string) (leader id, index, term int, err error) {
+	for serverID, s := range c.servers {
+		index, term, isLeader := s.Start(command)
+		if isLeader {
+			return serverID, index, term, nil
+		}
+	}
+	return "", -1, -1, errors.New("no leader available")
+}
+
 func (c *cluster) snapshot() clusterSnapshot {
 	network := c.network.snapshot()
 	nodes := make([]nodeSnapshot, 0, len(c.servers))

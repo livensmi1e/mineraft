@@ -23,12 +23,14 @@ body {
 }
 
 button,
-select {
+select,
+input {
   font: inherit;
 }
 
 button:focus-visible,
-select:focus-visible {
+select:focus-visible,
+input:focus-visible {
   outline: 3px solid #8bb5ff;
   outline-offset: 2px;
 }
@@ -92,6 +94,7 @@ h3 {
 
 .controls {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 20px;
@@ -110,6 +113,52 @@ h3 {
   align-items: center;
   font-size: 0.82rem;
   font-weight: 650;
+}
+
+.command-form {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+}
+
+.command-form label {
+  display: grid;
+  gap: 4px;
+}
+
+input {
+  width: 148px;
+  min-height: 36px;
+  padding: 5px 8px;
+  border: 1px solid #aab2ac;
+  border-radius: 2px;
+  color: var(--ink);
+  background: #fff;
+}
+
+.command-form button,
+.node-action {
+  min-height: 36px;
+  padding: 5px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  color: #fff;
+  background: var(--accent);
+  cursor: pointer;
+}
+
+.command-form button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.command-status {
+  color: var(--muted);
+  font-size: 0.72rem;
+}
+
+.command-status.error {
+  color: var(--danger);
 }
 
 select {
@@ -131,6 +180,13 @@ select {
 .simulation,
 .details {
   min-width: 0;
+}
+
+.simulation {
+  padding: 22px 0;
+}
+
+.details {
   padding: 22px;
 }
 
@@ -223,7 +279,7 @@ select {
   border-color: var(--accent);
 }
 
-.node[aria-pressed="true"] {
+.node.isolated {
   border-style: dashed;
   border-color: var(--danger);
   color: var(--muted);
@@ -324,12 +380,13 @@ select {
 
 .log-entry,
 .log-empty {
-  min-width: 62px;
+  min-width: max-content;
   padding: 6px 7px;
   border: 1px dashed #abb4ae;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 0.7rem;
   text-align: center;
+  white-space: nowrap;
 }
 
 .log-entry.committed {
@@ -344,6 +401,11 @@ select {
 
 .node-details {
   margin: 0 0 26px;
+}
+
+.node-action {
+  width: 100%;
+  margin: -10px 0 26px;
 }
 
 .node-details div {
@@ -370,6 +432,12 @@ select {
   margin-bottom: 9px;
 }
 
+.event-note {
+  margin: -4px 0 9px;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
 .event-list {
   max-height: 470px;
   margin: 0;
@@ -380,7 +448,7 @@ select {
 
 .event-list li {
   display: grid;
-  grid-template-columns: 54px 1fr;
+  grid-template-columns: 74px 1fr;
   gap: 7px;
   padding: 7px 0;
   border-top: 1px solid var(--line);
@@ -391,6 +459,10 @@ select {
 .empty-event {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
+}
+
+.event-list time {
+  white-space: nowrap;
 }
 
 .event-list .event-error {

@@ -11,10 +11,15 @@ const details = document.querySelector("#node-details");
 const eventList = document.querySelector("#event-list");
 const connection = document.querySelector(".connection");
 const connectionStatus = document.querySelector("#connection-status");
+const nodeAction = document.querySelector("#node-action");
+const commandForm = document.querySelector("#command-form");
+const commandInput = document.querySelector("#command-input");
+const commandStatus = document.querySelector("#command-status");
 
 let snapshot = null;
 let selectedNode = null;
 let nodePositions = new Map();
+const nodeButtons = new Map();
 let refreshTimer = null;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -59,26 +64,40 @@ function render(data) {
 function renderNodes(data) {
   const positions = calculatePositions(data.nodes.length);
   nodePositions = new Map();
-  nodeLayer.replaceChildren();
+  const nodeIDs = new Set();
 
   data.nodes.forEach((node, index) => {
     const position = positions[index];
     nodePositions.set(node.id, position);
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `node ${node.state}${selectedNode === node.id ? " selected" : ""}`;
+    nodeIDs.add(node.id);
+    const button = nodeButtons.get(node.id) || createNodeButton(node.id);
+    button.className = `node ${node.state}${!node.networkReady ? " isolated" : ""}${selectedNode === node.id ? " selected" : ""}`;
     button.style.left = `${position.x}px`;
     button.style.top = `${position.y}px`;
-    button.setAttribute("aria-pressed", String(!node.networkReady));
-    button.setAttribute("aria-label", `${node.id}, ${node.state}, term ${node.currentTerm}. ${node.networkReady ? "Click to isolate" : "Click to reconnect"}`);
+    button.setAttribute("aria-pressed", String(selectedNode === node.id));
+    button.setAttribute("aria-label", `${node.id}, ${node.networkReady ? node.state : "isolated"}, term ${node.currentTerm}. Click to view details.`);
 
-    const name = text("span", "node-id", node.id);
-    const role = text("span", "node-role", node.networkReady ? node.state : "isolated");
-    const term = text("span", "node-term", `term ${node.currentTerm}`);
-    button.append(name, role, term);
-    button.addEventListener("click", () => toggleNode(node));
-    nodeLayer.append(button);
+    button.querySelector(".node-id").textContent = node.id;
+    button.querySelector(".node-role").textContent = node.networkReady ? node.state : "isolated";
+    button.querySelector(".node-term").textContent = `term ${node.currentTerm}`;
   });
+
+  nodeButtons.forEach((button, nodeID) => {
+    if (!nodeIDs.has(nodeID)) {
+      button.remove();
+      nodeButtons.delete(nodeID);
+    }
+  });
+}
+
+function createNodeButton(nodeID) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.append(text("span", "node-id", nodeID), text("span", "node-role", ""), text("span", "node-term", ""));
+  button.addEventListener("click", () => selectNode(nodeID));
+  nodeLayer.append(button);
+  nodeButtons.set(nodeID, button);
+  return button;
 }
 
 function calculatePositions(count) {
@@ -132,8 +151,7 @@ function renderLogs(nodes) {
       row.append(text("span", "log-empty", "empty"));
     } else {
       node.log.forEach((entry, index) => {
-        const cell = text("span", `log-entry${index + 1 <= node.commitIndex ? " committed" : ""}`, `${index + 1} · t${entry.term}`);
-        cell.title = entry.command;
+        const cell = text("span", `log-entry${index + 1 <= node.commitIndex ? " committed" : ""}`, `${entry.command} · term ${entry.term}`);
         row.append(cell);
       });
     }
@@ -145,6 +163,7 @@ function renderDetails(node) {
   if (!node) {
     detailsHeading.textContent = "Select a node";
     setDetailValues(["—", "—", "—", "—", "—"]);
+    nodeAction.hidden = true;
     return;
   }
   detailsHeading.textContent = node.id;
@@ -155,6 +174,8 @@ function renderDetails(node) {
     node.commitIndex,
     node.lastApplied,
   ]);
+  nodeAction.hidden = false;
+  nodeAction.textContent = node.networkReady ? "Isolate node" : "Reconnect node";
 }
 
 function setDetailValues(values) {
@@ -163,8 +184,12 @@ function setDetailValues(values) {
   });
 }
 
-async function toggleNode(node) {
-  selectedNode = node.id;
+function selectNode(nodeID) {
+  selectedNode = nodeID;
+  render(snapshot);
+}
+
+async function setNodeAvailability(node) {
   try {
     snapshot = await request("/api/nodes", {
       method: "POST",
@@ -174,6 +199,35 @@ async function toggleNode(node) {
   } catch (error) {
     setConnection(false, error.message);
   }
+}
+
+nodeAction.addEventListener("click", () => {
+  const node = snapshot?.nodes.find((item) => item.id === selectedNode);
+  if (node) setNodeAvailability(node);
+});
+
+commandForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = commandForm.querySelector("button");
+  button.disabled = true;
+  try {
+    const result = await request("/api/commands", {
+      method: "POST",
+      body: JSON.stringify({command: commandInput.value}),
+    });
+    commandInput.value = "";
+    setCommandStatus(`Accepted by ${result.leader} · index ${result.index} · pending commit`);
+    refresh();
+  } catch (error) {
+    setCommandStatus(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+function setCommandStatus(message, isError = false) {
+  commandStatus.textContent = message;
+  commandStatus.classList.toggle("error", isError);
 }
 
 modeSelect.addEventListener("change", async () => {
@@ -227,10 +281,11 @@ function appendEvent(event) {
   const summary = document.createElement("span");
   summary.textContent = `${event.from} → ${event.to} · ${event.method} · ${event.stage}${event.error ? ` (${event.error})` : ""}`;
   item.append(timestamp, summary);
-  eventList.prepend(item);
+  eventList.append(item);
   while (eventList.children.length > 80) {
-    eventList.lastElementChild.remove();
+    eventList.firstElementChild.remove();
   }
+  eventList.scrollTop = eventList.scrollHeight;
 }
 
 function animateMessage(event) {
