@@ -99,11 +99,17 @@ func (c *cluster) snapshot() clusterSnapshot {
 type eventHub struct {
 	mu          sync.Mutex
 	subscribers map[chan rpcEvent]struct{}
+	history     []rpcEvent
 	closed      bool
 }
 
+const eventHistoryLimit = 80
+
 func newEventHub() *eventHub {
-	return &eventHub{subscribers: make(map[chan rpcEvent]struct{})}
+	return &eventHub{
+		subscribers: make(map[chan rpcEvent]struct{}),
+		history:     make([]rpcEvent, 0, eventHistoryLimit),
+	}
 }
 
 func (h *eventHub) publish(event rpcEvent) {
@@ -113,6 +119,12 @@ func (h *eventHub) publish(event rpcEvent) {
 		return
 	}
 	event.At = time.Now()
+	if isNotableRPCEvent(event) {
+		h.history = append(h.history, event)
+		if len(h.history) > eventHistoryLimit {
+			h.history = h.history[len(h.history)-eventHistoryLimit:]
+		}
+	}
 	for subscriber := range h.subscribers {
 		select {
 		case subscriber <- event:
@@ -124,14 +136,30 @@ func (h *eventHub) publish(event rpcEvent) {
 func (h *eventHub) subscribe() (<-chan rpcEvent, func()) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	stream := make(chan rpcEvent, 64)
+	stream := make(chan rpcEvent, eventHistoryLimit+32)
 	if !h.closed {
+		for _, event := range h.history {
+			event.Replay = true
+			stream <- event
+		}
 		h.subscribers[stream] = struct{}{}
 	}
 	return stream, func() {
 		h.mu.Lock()
 		delete(h.subscribers, stream)
 		h.mu.Unlock()
+	}
+}
+
+func isNotableRPCEvent(event rpcEvent) bool {
+	if !event.Heartbeat {
+		return true
+	}
+	switch event.Stage {
+	case "dropped", "unreachable", "cancelled", "rejected":
+		return true
+	default:
+		return false
 	}
 }
 

@@ -76,12 +76,23 @@
         <button id="node-action" class="node-action" type="button" hidden></button>
 
         <h3 class="event-heading">RPC events</h3>
-        <p class="event-note">Heartbeat traffic stays on the graph.</p>
+        <p class="event-note">Heartbeats animate on the graph. Select an event for details.</p>
         <ol id="event-list" class="event-list" aria-live="polite" aria-label="RPC events">
-          <li class="empty-event">No notable RPCs yet.</li>
+          <li class="empty-event">No votes, log entries, or failures yet.</li>
         </ol>
       </aside>
     </div>
   </main>
+
+  <dialog id="event-dialog" class="event-dialog" aria-labelledby="event-dialog-heading">
+    <form method="dialog" class="event-dialog-header">
+      <div>
+        <h2 id="event-dialog-heading">RPC event</h2>
+        <p id="event-dialog-summary"></p>
+      </div>
+      <button class="event-dialog-close" type="submit">Close</button>
+    </form>
+    <dl id="event-details" class="event-details"></dl>
+  </dialog>
 </body>
 </html>

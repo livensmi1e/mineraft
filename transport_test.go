@@ -104,9 +104,10 @@ func TestNetworkMarksEmptyAppendEntriesAsHeartbeat(t *testing.T) {
 
 	stream, unsubscribe := events.subscribe()
 	defer unsubscribe()
+	args := appendEntriesArgs{Term: 4, LeaderID: "S1", PrevLogIndex: 2, PrevLogTerm: 3, LeaderCommit: 1}
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := network.appendEntries(context.Background(), "S1", "S2", appendEntriesArgs{})
+		_, err := network.appendEntries(context.Background(), "S1", "S2", args)
 		errCh <- err
 	}()
 
@@ -115,11 +116,38 @@ func TestNetworkMarksEmptyAppendEntriesAsHeartbeat(t *testing.T) {
 		if event.Stage != "sent" || !event.Heartbeat {
 			t.Fatalf("first event = %+v, want sent heartbeat", event)
 		}
+		eventArgs, ok := event.Args.(appendEntriesArgs)
+		if !ok || eventArgs.Term != args.Term || eventArgs.LeaderID != args.LeaderID ||
+			eventArgs.PrevLogIndex != args.PrevLogIndex || eventArgs.PrevLogTerm != args.PrevLogTerm ||
+			eventArgs.LeaderCommit != args.LeaderCommit || len(eventArgs.Entries) != 0 {
+			t.Fatalf("event args = %#v, want %#v", event.Args, args)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for heartbeat event")
 	}
 	if err := <-errCh; err != nil {
 		t.Fatalf("append entries: %v", err)
+	}
+}
+
+func TestEventHubReplaysNotableEvents(t *testing.T) {
+	events := newEventHub()
+	events.publish(rpcEvent{Method: "AppendEntries", Stage: "sent", Heartbeat: true})
+	events.publish(rpcEvent{From: "S1", To: "S2", Method: "RequestVote", Stage: "sent", Term: 3})
+
+	if len(events.history) != 1 {
+		t.Fatalf("history length = %d, want 1", len(events.history))
+	}
+
+	stream, unsubscribe := events.subscribe()
+	defer unsubscribe()
+	select {
+	case event := <-stream:
+		if !event.Replay || event.From != "S1" || event.To != "S2" || event.Method != "RequestVote" || event.Stage != "sent" {
+			t.Fatalf("replayed event = %+v, want RequestVote sent from S1 to S2", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for replayed event")
 	}
 }
 

@@ -15,6 +15,10 @@ const nodeAction = document.querySelector("#node-action");
 const commandForm = document.querySelector("#command-form");
 const commandInput = document.querySelector("#command-input");
 const commandStatus = document.querySelector("#command-status");
+const eventDialog = document.querySelector("#event-dialog");
+const eventDialogHeading = document.querySelector("#event-dialog-heading");
+const eventDialogSummary = document.querySelector("#event-dialog-summary");
+const eventDetails = document.querySelector("#event-details");
 
 let snapshot = null;
 let selectedNode = null;
@@ -46,11 +50,11 @@ async function refresh() {
 }
 
 function scheduleRefresh() {
-  if (refreshTimer !== null) return;
+  if (refreshTimer !== null) window.clearTimeout(refreshTimer);
   refreshTimer = window.setTimeout(() => {
     refreshTimer = null;
     refresh();
-  }, 100);
+  }, 120);
 }
 
 function render(data) {
@@ -103,8 +107,8 @@ function createNodeButton(nodeID) {
 function calculatePositions(count) {
   const width = stage.clientWidth;
   const height = stage.clientHeight;
-  const radiusX = Math.min(width * 0.34, 300);
-  const radiusY = Math.min(height * 0.35, 150);
+  const radiusX = Math.min(width * 0.27, 250);
+  const radiusY = Math.min(height * 0.34, 142);
   return Array.from({length: count}, (_, index) => {
     const angle = -Math.PI / 2 + (index * 2 * Math.PI) / count;
     return {
@@ -258,10 +262,10 @@ function connectEvents() {
     if (!event.heartbeat || ["dropped", "unreachable", "cancelled", "rejected"].includes(event.stage)) {
       appendEvent(event);
     }
-    if (event.stage === "sent") {
+    if (!event.replay && event.stage === "sent") {
       animateMessage(event);
     }
-    if (["delivered", "replied", "rejected"].includes(event.stage)) scheduleRefresh();
+    if (!event.replay && ["replied", "rejected"].includes(event.stage)) scheduleRefresh();
   };
 }
 
@@ -271,21 +275,61 @@ function appendEvent(event) {
   if (["dropped", "unreachable", "cancelled", "rejected"].includes(event.stage)) {
     item.className = "event-error";
   }
+  const followNewest = eventList.scrollHeight - eventList.scrollTop - eventList.clientHeight < 16;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "event-button";
+  button.setAttribute("aria-label", `Show details for ${event.from} to ${event.to}: ${event.method}, ${event.stage}`);
+  button.addEventListener("click", () => showEventDetails(event));
   const timestamp = document.createElement("time");
   timestamp.dateTime = event.at;
-  timestamp.textContent = new Date(event.at).toLocaleTimeString("en-US", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  timestamp.textContent = formatEventTime(event.at);
   const summary = document.createElement("span");
   summary.textContent = `${event.from} → ${event.to} · ${event.method} · ${event.stage}${event.error ? ` (${event.error})` : ""}`;
-  item.append(timestamp, summary);
+  button.append(timestamp, summary);
+  item.append(button);
   eventList.append(item);
   while (eventList.children.length > 80) {
     eventList.firstElementChild.remove();
   }
-  eventList.scrollTop = eventList.scrollHeight;
+  if (followNewest) eventList.scrollTop = eventList.scrollHeight;
+}
+
+function showEventDetails(event) {
+  eventDialogHeading.textContent = `${event.method} · ${event.stage}`;
+  eventDialogSummary.textContent = `${event.from} → ${event.to}`;
+  eventDetails.replaceChildren(
+    eventDetail("Time", formatEventTime(event.at)),
+    eventDetail("Term", event.term),
+    eventDetail("Heartbeat", event.heartbeat ? "yes" : "no"),
+    eventDetail("RPC request arguments", JSON.stringify(event.args, null, 2), true),
+  );
+  if (event.error) eventDetails.append(eventDetail("Transport error", event.error));
+  if (!eventDialog.open) eventDialog.showModal();
+}
+
+function eventDetail(label, value, code = false) {
+  const group = document.createElement("div");
+  if (code) group.className = "event-args";
+  const name = text("dt", "", label);
+  const content = document.createElement("dd");
+  if (code) {
+    const pre = document.createElement("pre");
+    pre.textContent = value;
+    content.append(pre);
+  } else {
+    content.textContent = value;
+  }
+  group.append(name, content);
+  return group;
+}
+
+function formatEventTime(value) {
+  return new Date(value).toLocaleTimeString("en-US", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function animateMessage(event) {

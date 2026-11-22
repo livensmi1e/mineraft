@@ -40,6 +40,8 @@ type rpcEvent struct {
 	Stage     string    `json:"stage"`
 	Term      int       `json:"term"`
 	Heartbeat bool      `json:"heartbeat"`
+	Replay    bool      `json:"replay,omitempty"`
+	Args      any       `json:"args"`
 	Error     string    `json:"error,omitempty"`
 }
 
@@ -93,7 +95,7 @@ func (n *network) close() {
 
 func (n *network) requestVote(ctx context.Context, from, to id, args requestVoteArgs) (requestVoteReply, error) {
 	var reply requestVoteReply
-	err := n.call(ctx, from, to, "RequestVote", args.Term, false, func(handler rpcHandler) error {
+	err := n.call(ctx, from, to, "RequestVote", args.Term, false, args, func(handler rpcHandler) error {
 		var err error
 		reply, err = handler.RequestVote(ctx, args)
 		return err
@@ -104,7 +106,7 @@ func (n *network) requestVote(ctx context.Context, from, to id, args requestVote
 func (n *network) appendEntries(ctx context.Context, from, to id, args appendEntriesArgs) (appendEntriesReply, error) {
 	args.Entries = append([]logEntry(nil), args.Entries...)
 	var reply appendEntriesReply
-	err := n.call(ctx, from, to, "AppendEntries", args.Term, len(args.Entries) == 0, func(handler rpcHandler) error {
+	err := n.call(ctx, from, to, "AppendEntries", args.Term, len(args.Entries) == 0, args, func(handler rpcHandler) error {
 		var err error
 		reply, err = handler.AppendEntries(ctx, args)
 		return err
@@ -118,49 +120,50 @@ func (n *network) call(
 	method string,
 	term int,
 	heartbeat bool,
+	args any,
 	invoke func(rpcHandler) error,
 ) error {
-	n.events.publish(rpcEvent{From: from, To: to, Method: method, Stage: "sent", Term: term, Heartbeat: heartbeat})
+	n.events.publish(rpcEvent{From: from, To: to, Method: method, Stage: "sent", Term: term, Heartbeat: heartbeat, Args: args})
 
 	handler, mode, err := n.route(from, to)
 	if err != nil {
-		n.publishFailure(from, to, method, term, heartbeat, "unreachable", err)
+		n.publishFailure(from, to, method, term, heartbeat, args, "unreachable", err)
 		return err
 	}
 
 	if err := waitFor(ctx, n.delay(mode)); err != nil {
-		n.publishFailure(from, to, method, term, heartbeat, "cancelled", err)
+		n.publishFailure(from, to, method, term, heartbeat, args, "cancelled", err)
 		return err
 	}
 	if mode == unreliableNetwork && n.chance(0.15) {
-		n.publishFailure(from, to, method, term, heartbeat, "dropped", errDropped)
+		n.publishFailure(from, to, method, term, heartbeat, args, "dropped", errDropped)
 		return errDropped
 	}
 	if _, _, err := n.route(from, to); err != nil {
-		n.publishFailure(from, to, method, term, heartbeat, "unreachable", err)
+		n.publishFailure(from, to, method, term, heartbeat, args, "unreachable", err)
 		return err
 	}
 
-	n.events.publish(rpcEvent{From: from, To: to, Method: method, Stage: "delivered", Term: term, Heartbeat: heartbeat})
+	n.events.publish(rpcEvent{From: from, To: to, Method: method, Stage: "delivered", Term: term, Heartbeat: heartbeat, Args: args})
 	if err := invoke(handler); err != nil {
-		n.publishFailure(from, to, method, term, heartbeat, "rejected", err)
+		n.publishFailure(from, to, method, term, heartbeat, args, "rejected", err)
 		return err
 	}
 
 	if err := waitFor(ctx, n.delay(mode)); err != nil {
-		n.publishFailure(to, from, method, term, heartbeat, "cancelled", err)
+		n.publishFailure(to, from, method, term, heartbeat, args, "cancelled", err)
 		return err
 	}
 	if _, _, err := n.route(to, from); err != nil {
-		n.publishFailure(to, from, method, term, heartbeat, "unreachable", err)
+		n.publishFailure(to, from, method, term, heartbeat, args, "unreachable", err)
 		return err
 	}
 	if mode == unreliableNetwork && n.chance(0.15) {
-		n.publishFailure(to, from, method, term, heartbeat, "dropped", errDropped)
+		n.publishFailure(to, from, method, term, heartbeat, args, "dropped", errDropped)
 		return errDropped
 	}
 
-	n.events.publish(rpcEvent{From: to, To: from, Method: method, Stage: "replied", Term: term, Heartbeat: heartbeat})
+	n.events.publish(rpcEvent{From: to, To: from, Method: method, Stage: "replied", Term: term, Heartbeat: heartbeat, Args: args})
 	return nil
 }
 
@@ -236,7 +239,7 @@ func (n *network) snapshot() networkSnapshot {
 	return networkSnapshot{Mode: n.mode, Nodes: nodes, DisabledLinks: disabledLinks}
 }
 
-func (n *network) publishFailure(from, to id, method string, term int, heartbeat bool, stage string, err error) {
+func (n *network) publishFailure(from, to id, method string, term int, heartbeat bool, args any, stage string, err error) {
 	n.events.publish(rpcEvent{
 		From:      from,
 		To:        to,
@@ -244,6 +247,7 @@ func (n *network) publishFailure(from, to id, method string, term int, heartbeat
 		Stage:     stage,
 		Term:      term,
 		Heartbeat: heartbeat,
+		Args:      args,
 		Error:     err.Error(),
 	})
 }
