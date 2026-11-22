@@ -17,9 +17,11 @@ const (
 )
 
 const (
-	minElectionTimeout = 150 * time.Millisecond
-	maxElectionTimeout = 300 * time.Millisecond
-	heartbeatInterval  = 50 * time.Millisecond // why 50ms
+	// These values intentionally pace the interactive simulator. They are not
+	// production Raft tuning: a heartbeat still arrives well before election.
+	minElectionTimeout = 1 * time.Second
+	maxElectionTimeout = 3 * time.Second
+	heartbeatInterval  = 500 * time.Millisecond
 )
 
 type id string

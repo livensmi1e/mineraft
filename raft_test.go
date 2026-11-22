@@ -813,7 +813,7 @@ func newStoppedTestServer(t *testing.T, me id, peers []id, role state, term int,
 func waitForCondition(t *testing.T, description string, condition func() bool) {
 	t.Helper()
 
-	deadline := time.NewTimer(time.Second)
+	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()

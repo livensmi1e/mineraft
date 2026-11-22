@@ -15,6 +15,7 @@ const connectionStatus = document.querySelector("#connection-status");
 let snapshot = null;
 let selectedNode = null;
 let nodePositions = new Map();
+let refreshTimer = null;
 const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
 
 async function request(path, options = {}) {
@@ -37,6 +38,14 @@ async function refresh() {
   } catch (error) {
     setConnection(false, error.message);
   }
+}
+
+function scheduleRefresh() {
+  if (refreshTimer !== null) return;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = null;
+    refresh();
+  }, 100);
 }
 
 function render(data) {
@@ -192,11 +201,13 @@ function connectEvents() {
   source.onmessage = (message) => {
     const event = JSON.parse(message.data);
     document.querySelector(".stage-note")?.remove();
-    appendEvent(event);
-    if (event.stage === "sent" || event.stage === "replied") {
+    if (!event.heartbeat || ["dropped", "unreachable", "cancelled", "rejected"].includes(event.stage)) {
+      appendEvent(event);
+    }
+    if (event.stage === "sent") {
       animateMessage(event);
     }
-    if (["delivered", "replied", "rejected"].includes(event.stage)) refresh();
+    if (["delivered", "replied", "rejected"].includes(event.stage)) scheduleRefresh();
   };
 }
 
@@ -233,7 +244,7 @@ function animateMessage(event) {
   const animation = message.animate([
     {transform: `translate(${start.x}px, ${start.y}px)`, opacity: 0.9},
     {transform: `translate(${end.x}px, ${end.y}px)`, opacity: 0.9},
-  ], {duration: reduceMotion.matches ? 1 : 520, easing: "cubic-bezier(.22,.75,.3,1)"});
+  ], {duration: reduceMotion.matches ? 1 : 180, easing: "cubic-bezier(.22,.75,.3,1)"});
   animation.finished.finally(() => message.remove());
 }
 

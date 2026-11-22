@@ -92,6 +92,37 @@ func TestNetworkRejectsTrafficFromIsolatedNode(t *testing.T) {
 	}
 }
 
+func TestNetworkMarksEmptyAppendEntriesAsHeartbeat(t *testing.T) {
+	events := newEventHub()
+	network := newNetwork(1, events)
+	if err := network.register("S1", &testRPCHandler{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := network.register("S2", &testRPCHandler{}); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, unsubscribe := events.subscribe()
+	defer unsubscribe()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := network.appendEntries(context.Background(), "S1", "S2", appendEntriesArgs{})
+		errCh <- err
+	}()
+
+	select {
+	case event := <-stream:
+		if event.Stage != "sent" || !event.Heartbeat {
+			t.Fatalf("first event = %+v, want sent heartbeat", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for heartbeat event")
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("append entries: %v", err)
+	}
+}
+
 func TestNetworkDoesNotDeliverRPCStartedBeforeClose(t *testing.T) {
 	events := newEventHub()
 	network := newNetwork(1, events)

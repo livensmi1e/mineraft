@@ -41,6 +41,18 @@ func TestConfigureNetworkRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+func TestNewClusterStartsInReliableNetworkMode(t *testing.T) {
+	cluster, err := newCluster([]id{"S1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cluster.close()
+
+	if cluster.snapshot().Network.Mode != reliableNetwork {
+		t.Fatalf("network mode = %q, want %q", cluster.snapshot().Network.Mode, reliableNetwork)
+	}
+}
+
 func TestConfigureNodeChangesNetworkState(t *testing.T) {
 	cluster, err := newCluster([]id{"S1"})
 	if err != nil {
