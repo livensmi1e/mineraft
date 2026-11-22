@@ -134,6 +134,10 @@ func (n *network) call(
 		n.publishFailure(from, to, method, term, "dropped", errDropped)
 		return errDropped
 	}
+	if _, _, err := n.route(from, to); err != nil {
+		n.publishFailure(from, to, method, term, "unreachable", err)
+		return err
+	}
 
 	n.events.publish(rpcEvent{From: from, To: to, Method: method, Stage: "delivered", Term: term})
 	if err := invoke(handler); err != nil {

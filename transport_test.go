@@ -91,3 +91,47 @@ func TestNetworkRejectsTrafficFromIsolatedNode(t *testing.T) {
 		t.Fatalf("append entries error = %v, want %v", err, errUnreachable)
 	}
 }
+
+func TestNetworkDoesNotDeliverRPCStartedBeforeClose(t *testing.T) {
+	events := newEventHub()
+	network := newNetwork(1, events)
+	from := &testRPCHandler{}
+	to := &testRPCHandler{voteReply: requestVoteReply{VoteGranted: true}}
+	if err := network.register("S1", from); err != nil {
+		t.Fatal(err)
+	}
+	if err := network.register("S2", to); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, unsubscribe := events.subscribe()
+	defer unsubscribe()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := network.requestVote(context.Background(), "S1", "S2", requestVoteArgs{Term: 1})
+		errCh <- err
+	}()
+
+	select {
+	case event := <-stream:
+		if event.Stage != "sent" {
+			t.Fatalf("first event stage = %q, want sent", event.Stage)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for sent event")
+	}
+	network.close()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, errNetworkClosed) {
+			t.Fatalf("request vote error = %v, want %v", err, errNetworkClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request vote did not return after network close")
+	}
+	if to.voteCalls != 0 {
+		t.Fatalf("RequestVote calls = %d, want 0 after network close", to.voteCalls)
+	}
+}

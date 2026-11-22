@@ -80,33 +80,61 @@ type server struct {
 
 	db []string
 
-	timer  *time.Timer
-	stopCh chan struct{}
-	done   chan struct{}
+	// Election timing is owned by run. Other goroutines update the deadline
+	// while holding mu, then notify run to reprogram its local timer.
+	electionDeadline time.Time
+	electionResetCh  chan struct{}
+
+	// Each follower has one worker. Signals are deliberately coalesced: a
+	// worker always builds its request from the latest Raft state.
+	replicateCh map[id]chan struct{}
+
+	// electionVotes is meaningful only while state == candidate.
+	electionVotes int
+
+	// stopCh owns the server's background-work lifetime. It is intentionally
+	// separate from context.Context, which is scoped to individual RPCs.
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 func newServer(me id, peers []id, transport *network, currentTerm int, votedFor id, log []logEntry) *server {
 	s := &server{
-		me:          me,
-		peers:       append([]id(nil), peers...),
-		state:       follower,
-		transport:   transport,
-		nextIndex:   make(map[id]int), // 1 <= nextIndex <= len(log)+1
-		matchIndex:  make(map[id]int),
-		currentTerm: currentTerm,
-		votedFor:    votedFor,
-		log:         append([]logEntry(nil), log...),
-		db:          make([]string, 0),
-		timer:       time.NewTimer(randomElectionTimeout()),
-		stopCh:      make(chan struct{}),
-		done:        make(chan struct{}),
+		me:               me,
+		peers:            append([]id(nil), peers...),
+		state:            follower,
+		transport:        transport,
+		nextIndex:        make(map[id]int), // 1 <= nextIndex <= len(log)+1
+		matchIndex:       make(map[id]int),
+		currentTerm:      currentTerm,
+		votedFor:         votedFor,
+		log:              append([]logEntry(nil), log...),
+		db:               make([]string, 0),
+		electionDeadline: time.Now().Add(randomElectionTimeout()),
+		electionResetCh:  make(chan struct{}, 1),
+		replicateCh:      make(map[id]chan struct{}),
+		stopCh:           make(chan struct{}),
 	}
 
+	for _, peer := range s.peers {
+		if peer == s.me {
+			continue
+		}
+		work := make(chan struct{}, 1)
+		s.replicateCh[peer] = work
+		s.wg.Add(1)
+		go s.replicationWorker(peer, work)
+	}
+
+	s.wg.Add(1)
 	go s.run()
 	return s
 }
 
-func (s *server) lastLog() (index, term int) {
+// lastLogLocked returns the index and term of the local last entry. The caller
+// must hold s.mu.
+func (s *server) lastLogLocked() (index, term int) {
 	index = len(s.log)
 	if index == 0 {
 		return index, -1
@@ -114,96 +142,127 @@ func (s *server) lastLog() (index, term int) {
 	return index, s.log[index-1].Term
 }
 
-func (s *server) replicateLogs(leaderTerm int) {
-	s.mu.Lock()
-	if !(s.state == leader && s.currentTerm == leaderTerm) {
-		s.mu.Unlock()
-		return
+// triggerReplication wakes every follower worker. The buffer size of one
+// intentionally coalesces heartbeats and client commands while a worker is
+// already replicating.
+func (s *server) triggerReplication() {
+	for _, peer := range s.peers {
+		if peer == s.me {
+			continue
+		}
+		select {
+		case s.replicateCh[peer] <- struct{}{}:
+		default:
+		}
 	}
-	currentTerm := s.currentTerm
-	lastLogIndex, _ := s.lastLog()
-	commitIndex := s.commitIndex
-	s.mu.Unlock()
+}
 
-	var sendAppendEntries func(peer id)
-	sendAppendEntries = func(peer id) {
+// replicationWorker is the sole sender of AppendEntries to peer. Serializing
+// one peer's requests makes a failure reply unambiguously refer to the latest
+// nextIndex used by this worker.
+func (s *server) replicationWorker(peer id, work <-chan struct{}) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-work:
+			s.replicatePeer(peer)
+		}
+	}
+}
+
+// replicatePeer catches peer up for one trigger. Network failures return to
+// the worker; a later heartbeat or client command retries without recursion.
+func (s *server) replicatePeer(peer id) {
+	for {
 		s.mu.Lock()
-		prevLogIndex, prevLogTerm := s.nextIndex[peer]-1, -1
-		if prevLogIndex >= 1 {
-			prevLogTerm = s.log[prevLogIndex-1].Term
+		if s.state != leader {
+			s.mu.Unlock()
+			return
 		}
-		request := appendEntriesArgs{
-			Term:         currentTerm,
-			LeaderID:     s.me,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			LeaderCommit: commitIndex,
-		}
-		if lastLogIndex >= s.nextIndex[peer] {
-			request.Entries = slices.Clone(s.log[s.nextIndex[peer]-1:])
-		}
+		request := s.appendEntriesRequestLocked(peer)
 		s.mu.Unlock()
 
 		reply, err := s.appendEntries(context.Background(), peer, request)
 		if err != nil {
-			sendAppendEntries(peer) // retry, stack overflow
 			return
 		}
 
 		s.mu.Lock()
 		if reply.Term > s.currentTerm {
-			s.state = follower
-			s.votedFor = ""
-			s.currentTerm = reply.Term
-			s.resetElectionTimer()
+			s.becomeFollowerLocked(reply.Term)
+			s.resetElectionDeadlineLocked()
+			s.mu.Unlock()
+			s.notifyElectionTimer()
+			return
+		}
+		if s.state != leader || s.currentTerm != request.Term {
 			s.mu.Unlock()
 			return
 		}
-		valid := s.state == leader && s.currentTerm == leaderTerm
-		if !valid {
-			s.mu.Unlock()
-			return
-		}
+
 		if reply.Success {
 			lastReplicatedIndex := request.PrevLogIndex + len(request.Entries)
-			// use max because 2nd request may be responded 1st
-			s.matchIndex[peer] = max(s.matchIndex[peer], lastReplicatedIndex)
-			s.nextIndex[peer] = max(s.nextIndex[peer], lastReplicatedIndex+1)
-
-			for N := len(s.log); N >= s.commitIndex+1; N-- {
-				if s.log[N-1].Term != s.currentTerm {
-					continue
-				}
-				count := 1
-				for _, val := range s.matchIndex {
-					if val >= N {
-						count++
-					}
-				}
-				if majority(count, len(s.peers)) {
-					s.commitIndex = N
-					s.applyCommittedLocked()
-					break
-				}
-			}
-		} else {
-			if s.nextIndex[peer] > 1 {
-				s.nextIndex[peer]--
-			}
+			s.matchIndex[peer] = lastReplicatedIndex
+			s.nextIndex[peer] = lastReplicatedIndex + 1
+			commitAdvanced := s.advanceCommitIndexLocked()
 			s.mu.Unlock()
-			sendAppendEntries(peer) // stack overflow
+			if commitAdvanced {
+				// Promptly carry the new LeaderCommit to every follower.
+				s.triggerReplication()
+			}
 			return
 		}
+
+		if s.nextIndex[peer] == 1 {
+			s.mu.Unlock()
+			return
+		}
+		s.nextIndex[peer]--
 		s.mu.Unlock()
 	}
+}
 
-	// send initial heartbeats to init authority
-	for _, p := range s.peers {
-		if p == s.me {
+// appendEntriesRequestLocked snapshots the latest state for one follower.
+func (s *server) appendEntriesRequestLocked(peer id) appendEntriesArgs {
+	nextIndex := s.nextIndex[peer]
+	prevLogIndex, prevLogTerm := nextIndex-1, -1
+	if prevLogIndex >= 1 {
+		prevLogTerm = s.log[prevLogIndex-1].Term
+	}
+
+	request := appendEntriesArgs{
+		Term:         s.currentTerm,
+		LeaderID:     s.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: s.commitIndex,
+	}
+	if nextIndex <= len(s.log) {
+		request.Entries = slices.Clone(s.log[nextIndex-1:])
+	}
+	return request
+}
+
+func (s *server) advanceCommitIndexLocked() bool {
+	for index := len(s.log); index >= s.commitIndex+1; index-- {
+		if s.log[index-1].Term != s.currentTerm {
 			continue
 		}
-		go sendAppendEntries(p) // goroutine?
+		count := 1 // The leader stores every entry in its own log.
+		for _, matchIndex := range s.matchIndex {
+			if matchIndex >= index {
+				count++
+			}
+		}
+		if majority(count, len(s.peers)) {
+			s.commitIndex = index
+			s.applyCommittedLocked()
+			return true
+		}
 	}
+	return false
 }
 
 func (s *server) applyCommittedLocked() {
@@ -213,136 +272,150 @@ func (s *server) applyCommittedLocked() {
 	}
 }
 
-// Locked:
-//
-//	become candidate
-//	increment term
-//	vote for self
-//	snapshot term + last log
-//
-// Unlocked:
-//
-//	send RequestVote RPCs
-//
-// Locked for each reply:
-//
-//	verify reply is still relevant
-//	update state
+// candidateDoElection starts a new election immediately. Timer-driven
+// elections use handleElectionTimeout, which first verifies the deadline.
 func (s *server) candidateDoElection() {
-	// become candidate, start election
 	s.mu.Lock()
+	electionTerm, args, peers := s.beginElectionLocked()
+	s.mu.Unlock()
+
+	s.notifyElectionTimer()
+	s.sendRequestVotes(electionTerm, args, peers)
+}
+
+func (s *server) beginElectionLocked() (int, requestVoteArgs, []id) {
 	s.state = candidate
 	s.currentTerm++
 	s.votedFor = s.me
-	s.resetElectionTimer()
+	s.electionVotes = 1
+	s.resetElectionDeadlineLocked()
 
-	lastLogIndex, lastLogTerm := s.lastLog()
-	electionTerm := s.currentTerm
-	s.mu.Unlock()
+	lastLogIndex, lastLogTerm := s.lastLogLocked()
+	args := requestVoteArgs{
+		Term:         s.currentTerm,
+		CandidateID:  s.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+	return s.currentTerm, args, append([]id(nil), s.peers...)
+}
 
-	count, total := 1, len(s.peers)
-
-	for _, p := range s.peers {
-		if p == s.me {
+func (s *server) sendRequestVotes(electionTerm int, args requestVoteArgs, peers []id) {
+	// handleRequestVoteReply accepts a reply only while this election is still
+	// active, so a late reply cannot revive an older term.
+	for _, peer := range peers {
+		if peer == s.me {
 			continue
 		}
-		go func() {
-			reply, _ := s.requestVote(context.Background(), p, requestVoteArgs{
-				Term:         electionTerm,
-				CandidateID:  s.me, // me never change, safe
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			})
-
-			s.mu.Lock()
-			if reply.Term > s.currentTerm {
-				s.state = follower
-				s.votedFor = ""
-				s.currentTerm = reply.Term
-				s.resetElectionTimer()
-				s.mu.Unlock()
+		s.wg.Add(1)
+		go func(peer id) {
+			defer s.wg.Done()
+			reply, err := s.requestVote(context.Background(), peer, args)
+			if err != nil {
 				return
 			}
-			valid := s.state == candidate && s.currentTerm == electionTerm
-			if !valid {
-				s.mu.Unlock()
-				return
-			}
-			if reply.VoteGranted {
-				count++
-			}
-			if majority(count, total) {
-				// transition to leader, be atomic
-				s.state = leader
-				lastLogIndex, _ := s.lastLog()
-				for _, p := range s.peers {
-					if p == s.me {
-						continue
-					}
-					s.nextIndex[p] = lastLogIndex + 1
-					s.matchIndex[p] = 0
-				}
-				s.mu.Unlock()
-				s.replicateLogs(electionTerm) // goroutine?
-				return
-			}
-			s.mu.Unlock()
-		}()
+			s.handleRequestVoteReply(electionTerm, reply)
+		}(peer)
 	}
 }
 
-func (s *server) handleTimeout() {
-	s.mu.RLock()
-	state := s.state
-	if state == leader {
-		s.mu.RUnlock()
+func (s *server) handleRequestVoteReply(electionTerm int, reply requestVoteReply) {
+	var notifyTimer, startReplication bool
+
+	s.mu.Lock()
+	if reply.Term > s.currentTerm {
+		s.becomeFollowerLocked(reply.Term)
+		s.resetElectionDeadlineLocked()
+		notifyTimer = true
+	} else if s.state == candidate && s.currentTerm == electionTerm && reply.VoteGranted {
+		s.electionVotes++
+		if majority(s.electionVotes, len(s.peers)) {
+			s.becomeLeaderLocked()
+			notifyTimer = true
+			startReplication = true
+		}
+	}
+	s.mu.Unlock()
+
+	if notifyTimer {
+		s.notifyElectionTimer()
+	}
+	if startReplication {
+		s.triggerReplication()
+	}
+}
+
+func (s *server) becomeLeaderLocked() {
+	s.state = leader
+	s.electionVotes = 0
+	s.electionDeadline = time.Time{}
+	lastLogIndex, _ := s.lastLogLocked()
+	for _, peer := range s.peers {
+		if peer == s.me {
+			continue
+		}
+		s.nextIndex[peer] = lastLogIndex + 1
+		s.matchIndex[peer] = 0
+	}
+}
+
+// becomeFollowerLocked updates term-dependent state but deliberately leaves
+// election timing to its caller. A granted vote or a valid AppendEntries resets
+// the deadline; merely receiving RequestVote does not.
+func (s *server) becomeFollowerLocked(term int) {
+	if term > s.currentTerm {
+		s.currentTerm = term
+		s.votedFor = ""
+	}
+	s.state = follower
+	s.electionVotes = 0
+}
+
+func (s *server) handleElectionTimeout() {
+	s.mu.Lock()
+	if s.state == leader || time.Now().Before(s.electionDeadline) {
+		s.mu.Unlock()
 		return
 	}
-	s.mu.RUnlock()
-	s.candidateDoElection()
+	electionTerm, args, peers := s.beginElectionLocked()
+	s.mu.Unlock()
+
+	s.notifyElectionTimer()
+	s.sendRequestVotes(electionTerm, args, peers)
 }
 
-// run is the starting point for election timers, heartbeats, and applying
-// committed entries.
+// run is the sole owner of the election timer and heartbeat ticker.
 func (s *server) run() {
-	defer close(s.done)
+	defer s.wg.Done()
 
-	ticker := time.NewTicker(heartbeatInterval)
-	defer ticker.Stop()
+	heartbeats := time.NewTicker(heartbeatInterval)
+	defer heartbeats.Stop()
+	electionTimer := time.NewTimer(s.electionDelay())
+	defer electionTimer.Stop()
 
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case <-s.timer.C:
-			s.handleTimeout()
-		case <-ticker.C:
+		case <-s.electionResetCh:
+			resetTimer(electionTimer, s.electionDelay())
+		case <-electionTimer.C:
+			s.handleElectionTimeout()
+			resetTimer(electionTimer, s.electionDelay())
+		case <-heartbeats.C:
 			s.mu.RLock()
 			isLeader := s.state == leader
-			term := s.currentTerm
 			s.mu.RUnlock()
 			if isLeader {
-				s.replicateLogs(term) // goroutine?
+				s.triggerReplication()
 			}
 		}
 	}
-
 }
 
 func (s *server) stop() {
-	select {
-	case <-s.stopCh:
-		return
-	default:
-		close(s.stopCh)
-	}
-	<-s.done
-	if !s.timer.Stop() {
-		select {
-		case <-s.timer.C:
-		default:
-		}
-	}
+	s.stopOnce.Do(func() { close(s.stopCh) })
+	s.wg.Wait()
 }
 
 // Start is called by client
@@ -356,56 +429,65 @@ func (s *server) Start(command string) (index int, term int, isLeader bool) {
 	s.log = append(s.log, logEntry{Term: term, Command: command})
 	index = len(s.log)
 	s.mu.Unlock()
-	s.replicateLogs(term)
+	s.triggerReplication()
 	return index, term, true
 }
 
 // RequestVote is called concurrently by the simulated network.
 func (s *server) RequestVote(ctx context.Context, args requestVoteArgs) (requestVoteReply, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if args.Term < s.currentTerm {
-		return requestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
+		reply := requestVoteReply{Term: s.currentTerm, VoteGranted: false}
+		s.mu.Unlock()
+		return reply, nil
 	}
+	notifyTimer := false
 	if args.Term > s.currentTerm {
-		s.currentTerm = args.Term
-		s.votedFor = ""
-		s.state = follower
+		s.becomeFollowerLocked(args.Term)
+		notifyTimer = true
 	}
 
-	lastLogIndex, lastLogTerm := s.lastLog()
+	lastLogIndex, lastLogTerm := s.lastLogLocked()
 	canVote := s.votedFor == "" || s.votedFor == args.CandidateID
 	logIsUpToDate := (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
 	if canVote && logIsUpToDate {
 		s.votedFor = args.CandidateID
-		s.resetElectionTimer()
-		return requestVoteReply{Term: s.currentTerm, VoteGranted: true}, nil
+		s.resetElectionDeadlineLocked()
+		notifyTimer = true
+		reply := requestVoteReply{Term: s.currentTerm, VoteGranted: true}
+		s.mu.Unlock()
+		if notifyTimer {
+			s.notifyElectionTimer()
+		}
+		return reply, nil
 	}
 
-	return requestVoteReply{Term: s.currentTerm, VoteGranted: false}, nil
+	reply := requestVoteReply{Term: s.currentTerm, VoteGranted: false}
+	s.mu.Unlock()
+	if notifyTimer {
+		s.notifyElectionTimer()
+	}
+	return reply, nil
 }
 
 // AppendEntries handles both heartbeats and log replication.
 func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (appendEntriesReply, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if args.Term < s.currentTerm {
-		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
+		reply := appendEntriesReply{Term: s.currentTerm, Success: false}
+		s.mu.Unlock()
+		return reply, nil
 	}
 
-	// valid leader request, reset timer
-	s.resetElectionTimer()
-
-	if s.state == candidate || s.state == leader {
-		s.state = follower
-	}
-	if args.Term > s.currentTerm {
-		s.currentTerm = args.Term
-		s.votedFor = ""
-	}
+	// Any non-stale AppendEntries is a valid leader contact for timing.
+	s.becomeFollowerLocked(args.Term)
+	s.resetElectionDeadlineLocked()
+	defer func() {
+		s.mu.Unlock()
+		s.notifyElectionTimer()
+	}()
 
 	if args.PrevLogIndex > len(s.log) {
 		return appendEntriesReply{Term: s.currentTerm, Success: false}, nil
@@ -448,7 +530,7 @@ func (s *server) AppendEntries(ctx context.Context, args appendEntriesArgs) (app
 }
 
 // requestVote and appendEntries are the only outbound RPC calls the Raft core
-// needs. Context cancellation is how callers stop waiting for failed peers.
+// needs. ctx belongs to one RPC attempt, never to the server's lifetime.
 func (s *server) requestVote(ctx context.Context, peer id, args requestVoteArgs) (requestVoteReply, error) {
 	return s.transport.requestVote(ctx, s.me, peer, args)
 }
@@ -472,14 +554,42 @@ func (s *server) snapshot() nodeSnapshot {
 	}
 }
 
-func (s *server) resetElectionTimer() {
-	if !s.timer.Stop() {
+// resetElectionDeadlineLocked changes Raft state only. run owns the actual
+// time.Timer and is notified after the caller releases mu.
+func (s *server) resetElectionDeadlineLocked() {
+	s.electionDeadline = time.Now().Add(randomElectionTimeout())
+}
+
+func (s *server) notifyElectionTimer() {
+	select {
+	case s.electionResetCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *server) electionDelay() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.state == leader {
+		return time.Hour
+	}
+	delay := time.Until(s.electionDeadline)
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+// resetTimer is called only by run, the sole owner of the time.Timer.
+func resetTimer(timer *time.Timer, delay time.Duration) {
+	if !timer.Stop() {
 		select {
-		case <-s.timer.C:
+		case <-timer.C:
 		default:
 		}
 	}
-	s.timer.Reset(randomElectionTimeout())
+	timer.Reset(delay)
 }
 
 func randomElectionTimeout() time.Duration {

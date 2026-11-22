@@ -421,3 +421,294 @@ unlock
 - **Key idea:** a mutex protects memory; it does not prove that an asynchronous
   event is still logically valid.
 
+# Second-pass review: mutex-safe, but workflow ownership is unclear
+
+- Snapshot: commit `dd79cbcac8eac97c109392d8972fbb34724eb70b`
+- Context: the first pass fixed the obvious deadlocks, snapshots outbound RPC
+  arguments, validates terms after replies, and adds heartbeat replication.
+- Remaining problem: several goroutines can start the same logical workflow.
+  The mutex protects individual field accesses, but no component owns the
+  complete lifecycle of an election, a timer, or replication to one follower.
+
+## Starting overlapping replication rounds for the same follower
+
+```go
+func (s *server) run() {
+	ticker := time.NewTicker(heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case <-s.timer.C:
+			s.handleTimeout()
+		case <-ticker.C:
+			s.mu.RLock()
+			isLeader := s.state == leader
+			term := s.currentTerm
+			s.mu.RUnlock()
+
+			if isLeader {
+				s.replicateLogs(term)
+			}
+		}
+	}
+}
+
+func (s *server) Start(command string) (int, int, bool) {
+	s.mu.Lock()
+	if s.state != leader {
+		s.mu.Unlock()
+		return -1, -1, false
+	}
+	term := s.currentTerm
+	s.log = append(s.log, logEntry{Term: term, Command: command})
+	s.mu.Unlock()
+
+	s.replicateLogs(term)
+	return len(s.log), term, true
+}
+```
+
+- **Problem:** `replicateLogs` can be started by leader election, every
+  heartbeat tick, every accepted client command, and its own retry path.
+- **Effect:** one follower can have several AppendEntries RPCs in flight at the
+  same time, each based on a different `nextIndex`, `commitIndex`, and log
+  snapshot.
+- **Why the mutex is insufficient:** it serializes individual updates, but it
+  does not serialize the meaning of whole replication rounds.
+- **Lesson:** give each follower one replication worker, or an equivalent
+  per-follower serialization rule. New work should wake or coalesce with that
+  worker rather than starting another independent loop.
+
+## Protecting successful replies but not stale failure replies
+
+```go
+if reply.Success {
+	lastReplicatedIndex := request.PrevLogIndex + len(request.Entries)
+
+	// A later success cannot make progress go backward.
+	s.matchIndex[peer] = max(s.matchIndex[peer], lastReplicatedIndex)
+	s.nextIndex[peer] = max(s.nextIndex[peer], lastReplicatedIndex+1)
+} else {
+	if s.nextIndex[peer] > 1 {
+		s.nextIndex[peer]--
+	}
+
+	s.mu.Unlock()
+	sendAppendEntries(peer)
+	return
+}
+```
+
+```text
+request A: nextIndex = 3, sent first
+request B: retry uses a newer nextIndex and succeeds
+           nextIndex becomes 6
+request A: old failure reply arrives late
+           nextIndex is decremented to 5
+```
+
+- **Problem:** `max` makes success monotonic, but a stale failure can still
+  move `nextIndex` backward.
+- **Effect:** replication loses proven progress or sends unnecessary old
+  entries. Under more complex interleavings, this becomes very hard to reason
+  about.
+- **Lesson:** a reply needs to be associated with the request that produced it.
+  The simplest approach is to allow only one active replication attempt per
+  follower. A request sequence number is another valid approach.
+
+## Retrying by recursive function calls
+
+```go
+reply, err := s.appendEntries(context.Background(), peer, request)
+if err != nil {
+	// A disconnected peer can make this recurse forever.
+	sendAppendEntries(peer)
+	return
+}
+
+if !reply.Success {
+	if s.nextIndex[peer] > 1 {
+		s.nextIndex[peer]--
+	}
+	s.mu.Unlock()
+
+	// At nextIndex == 1, a repeated false reply also recurses forever.
+	sendAppendEntries(peer)
+	return
+}
+```
+
+- **Problem:** retries consume stack frames instead of iterating.
+- **Effect:** a permanently unreachable peer can cause stack growth, a leaked
+  goroutine, and unbounded retry pressure. Heartbeats can start even more such
+  goroutines.
+- **Lesson:** retries should be an explicit loop with cancellation and a
+  waiting policy. In this project, a replication worker can retry when woken
+  by a heartbeat or a new command; no recursion is necessary.
+
+## Stopping the run loop without stopping server work
+
+```go
+func (s *server) stop() {
+	close(s.stopCh)
+	<-s.done
+}
+
+func (s *server) appendEntries(
+	ctx context.Context,
+	peer id,
+	args appendEntriesArgs,
+) (appendEntriesReply, error) {
+	return s.transport.appendEntries(ctx, s.me, peer, args)
+}
+
+// Callers currently use context.Background().
+reply, err := s.appendEntries(context.Background(), peer, request)
+```
+
+- **Problem:** `done` means only `run` exited. It does not mean outbound vote
+  RPCs, replication RPCs, or retry calls have stopped.
+- **Effect:** a server can appear stopped while old goroutines still send
+  traffic or mutate state after a delayed reply.
+- **Lesson:** create a server-lifetime context in `newServer`, cancel it in
+  `stop`, and derive role- or request-specific contexts when useful.
+- **Important:** cancellation handles cleanup; term and role checks are still
+  required for safety.
+
+## Checking follower state, then starting an election later
+
+```go
+func (s *server) handleTimeout() {
+	s.mu.RLock()
+	state := s.state
+	if state == leader {
+		s.mu.RUnlock()
+		return
+	}
+	s.mu.RUnlock()
+
+	// Another goroutine may receive a valid AppendEntries here.
+	s.candidateDoElection()
+}
+
+func (s *server) AppendEntries(
+	ctx context.Context,
+	args appendEntriesArgs,
+) (appendEntriesReply, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.resetElectionTimer()
+	s.state = follower
+	return appendEntriesReply{Term: s.currentTerm, Success: true}, nil
+}
+```
+
+```text
+run receives an old timeout event
+    ↓
+handleTimeout observes follower and unlocks
+    ↓
+AppendEntries resets the election timer and confirms a leader
+    ↓
+handleTimeout calls candidateDoElection anyway
+```
+
+- **Problem:** the read is mutex-protected, but the decision is not atomic with
+  the state transition.
+- **Effect:** a valid heartbeat can be followed immediately by an unnecessary
+  election.
+- **Lesson:** a timeout is an event, not proof that an election is still due.
+  Revalidate the timeout when performing the transition, ideally with timer
+  ownership and a deadline/generation managed by one goroutine.
+
+## Hiding lock requirements in helper functions
+
+```go
+func (s *server) lastLog() (index, term int) {
+	index = len(s.log)
+	if index == 0 {
+		return 0, -1
+	}
+	return index, s.log[index-1].Term
+}
+
+func (s *server) resetElectionTimer() {
+	if !s.timer.Stop() {
+		select {
+		case <-s.timer.C:
+		default:
+		}
+	}
+	s.timer.Reset(randomElectionTimeout())
+}
+
+func (s *server) applyCommittedLocked() {
+	for s.lastApplied < s.commitIndex {
+		s.lastApplied++
+		s.db = append(s.db, s.log[s.lastApplied-1].Command)
+	}
+}
+```
+
+- **Good example:** `applyCommittedLocked` documents its lock requirement in
+  its name.
+- **Problem:** `lastLog` and `resetElectionTimer` also depend on a particular
+  synchronization context, but their names do not say so.
+- **Effect:** a later caller can innocently introduce a data race, deadlock, or
+  timer lifecycle bug.
+- **Lesson:** either acquire the lock inside a public helper, or give an
+  internal helper a `Locked` suffix and call it only from documented critical
+  sections.
+
+## Repeating state-transition rules in several callbacks
+
+```go
+// Higher-term AppendEntries reply.
+s.state = follower
+s.votedFor = ""
+s.currentTerm = reply.Term
+s.resetElectionTimer()
+
+// Higher-term RequestVote.
+s.currentTerm = args.Term
+s.votedFor = ""
+s.state = follower
+
+// Same-term AppendEntries.
+if s.state == candidate || s.state == leader {
+	s.state = follower
+}
+```
+
+- **Problem:** state transitions are distributed across request handlers,
+  response handlers, and timeout logic.
+- **Effect:** adding a new field or invariant later means every copy must be
+  updated correctly. It is easy for one path to forget to clear a vote, stop
+  leader work, or reset a timer.
+- **Lesson:** a small helper such as `stepDownLocked(term)` is justified when
+  it centralizes an actual Raft invariant. This is not abstraction for its own
+  sake.
+
+## What was already right in this revision
+
+```text
+lock   -> update state and snapshot RPC arguments
+unlock -> perform network RPC
+lock   -> validate term and role before using the reply
+unlock
+```
+
+- Outbound RPCs do not hold `s.mu`, preventing the original distributed
+  deadlock.
+- Election and replication replies verify their term/role before most state
+  updates.
+- Request arguments are copied before an RPC, so one request is internally
+  consistent.
+- **Next lesson:** these local rules are necessary, but a complete sync model
+  also needs ownership: who starts work, who cancels it, and who is allowed to
+  have one active workflow for a peer or timer.
+

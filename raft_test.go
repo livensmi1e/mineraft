@@ -10,18 +10,19 @@ import (
 func newUnitServer(t *testing.T, role state, term int, votedFor id, entries []logEntry) *server {
 	t.Helper()
 
-	timer := time.NewTimer(time.Hour)
-	t.Cleanup(func() { timer.Stop() })
 	return &server{
-		me:          "S1",
-		peers:       []id{"S1", "S2", "S3"},
-		state:       role,
-		currentTerm: term,
-		votedFor:    votedFor,
-		log:         append([]logEntry(nil), entries...),
-		nextIndex:   make(map[id]int),
-		matchIndex:  make(map[id]int),
-		timer:       timer,
+		me:               "S1",
+		peers:            []id{"S1", "S2", "S3"},
+		state:            role,
+		currentTerm:      term,
+		votedFor:         votedFor,
+		log:              append([]logEntry(nil), entries...),
+		nextIndex:        make(map[id]int),
+		matchIndex:       make(map[id]int),
+		electionDeadline: time.Now().Add(time.Hour),
+		electionResetCh:  make(chan struct{}, 1),
+		replicateCh:      make(map[id]chan struct{}),
+		stopCh:           make(chan struct{}),
 	}
 }
 
@@ -550,6 +551,30 @@ func TestAppendEntriesDoesNotApplyUncommittedEntry(t *testing.T) {
 	}
 }
 
+func TestAppendEntriesPreventsStaleTimeoutElection(t *testing.T) {
+	s := newUnitServer(t, candidate, 3, "S1", nil)
+	s.electionDeadline = time.Now().Add(-time.Second)
+
+	_, err := s.AppendEntries(context.Background(), appendEntriesArgs{
+		Term:     3,
+		LeaderID: "S2",
+	})
+	if err != nil {
+		t.Fatalf("AppendEntries returned error: %v", err)
+	}
+
+	// Simulate run observing an old timer event immediately afterwards. The
+	// updated deadline must make that event harmless.
+	s.handleElectionTimeout()
+
+	if s.state != follower {
+		t.Errorf("state = %s, want follower", s.state)
+	}
+	if s.currentTerm != 3 {
+		t.Errorf("currentTerm = %d, want 3", s.currentTerm)
+	}
+}
+
 func TestStart(t *testing.T) {
 	t.Run("leader appends but does not apply before commit", func(t *testing.T) {
 		s := newUnitServer(t, leader, 4, "S1", []logEntry{{Command: "x=1", Term: 3}})
@@ -623,7 +648,7 @@ func TestReplicationCommitsAppliesAndPropagatesCommit(t *testing.T) {
 	}
 	leaderServer, followers := newRaftTestCluster(t, 3, entries)
 
-	leaderServer.replicateLogs(3)
+	leaderServer.triggerReplication()
 
 	waitForCondition(t, "leader to commit and apply entry", func() bool {
 		leaderServer.mu.RLock()
@@ -637,9 +662,10 @@ func TestReplicationCommitsAppliesAndPropagatesCommit(t *testing.T) {
 	}
 	leaderServer.mu.RUnlock()
 
-	// The first round carried LeaderCommit = 0. A later heartbeat delivers the
-	// commit decision to followers.
-	leaderServer.replicateLogs(3)
+	// A commit advancement wakes workers again so they carry the new
+	// LeaderCommit. Triggering once more is harmless and keeps this phase of the
+	// test explicit.
+	leaderServer.triggerReplication()
 
 	waitForCondition(t, "followers to apply committed entry", func() bool {
 		for _, follower := range followers {
@@ -668,7 +694,7 @@ func TestReplicationCommitsAppliesAndPropagatesCommit(t *testing.T) {
 func TestLeaderDoesNotDirectlyCommitPriorTermEntry(t *testing.T) {
 	leaderServer, followers := newRaftTestCluster(t, 3, []logEntry{{Command: "x=1", Term: 2}})
 
-	leaderServer.replicateLogs(3)
+	leaderServer.triggerReplication()
 
 	waitForCondition(t, "followers to replicate prior-term entry", func() bool {
 		for _, follower := range followers {
@@ -689,6 +715,33 @@ func TestLeaderDoesNotDirectlyCommitPriorTermEntry(t *testing.T) {
 	}
 	if leaderServer.lastApplied != 0 || len(leaderServer.db) != 0 {
 		t.Errorf("prior-term entry was applied: lastApplied=%d db=%v", leaderServer.lastApplied, leaderServer.db)
+	}
+}
+
+func TestStopStopsServerWorkers(t *testing.T) {
+	events := newEventHub()
+	network := newNetwork(1, events)
+	s := newServer("S1", []id{"S1", "S2"}, network, 0, "", nil)
+	t.Cleanup(func() {
+		network.close()
+		events.close()
+	})
+
+	stopped := make(chan struct{})
+	go func() {
+		s.stop()
+		close(stopped)
+	}()
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not wait for run and replication workers to exit")
+	}
+	select {
+	case <-s.stopCh:
+	default:
+		t.Fatal("stop did not close the server lifecycle channel")
 	}
 }
 
@@ -726,20 +779,35 @@ func newRaftTestCluster(t *testing.T, term int, entries []logEntry) (*server, []
 func newStoppedTestServer(t *testing.T, me id, peers []id, role state, term int, votedFor id, entries []logEntry, transport *network) *server {
 	t.Helper()
 
-	timer := time.NewTimer(time.Hour)
-	t.Cleanup(func() { timer.Stop() })
-	return &server{
-		me:          me,
-		peers:       append([]id(nil), peers...),
-		state:       role,
-		transport:   transport,
-		currentTerm: term,
-		votedFor:    votedFor,
-		log:         append([]logEntry(nil), entries...),
-		nextIndex:   make(map[id]int),
-		matchIndex:  make(map[id]int),
-		timer:       timer,
+	s := &server{
+		me:               me,
+		peers:            append([]id(nil), peers...),
+		state:            role,
+		transport:        transport,
+		currentTerm:      term,
+		votedFor:         votedFor,
+		log:              append([]logEntry(nil), entries...),
+		nextIndex:        make(map[id]int),
+		matchIndex:       make(map[id]int),
+		electionDeadline: time.Now().Add(time.Hour),
+		electionResetCh:  make(chan struct{}, 1),
+		replicateCh:      make(map[id]chan struct{}),
+		stopCh:           make(chan struct{}),
 	}
+	for _, peer := range peers {
+		if peer == me {
+			continue
+		}
+		work := make(chan struct{}, 1)
+		s.replicateCh[peer] = work
+		s.wg.Add(1)
+		go s.replicationWorker(peer, work)
+	}
+	t.Cleanup(func() {
+		close(s.stopCh)
+		s.wg.Wait()
+	})
+	return s
 }
 
 func waitForCondition(t *testing.T, description string, condition func() bool) {
